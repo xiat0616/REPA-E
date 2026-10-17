@@ -23,8 +23,6 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from utils import center_crop_arr
-
 
 def file_ext(name: Union[str, Path]) -> str:
     """Return the file extension without the leading ."""
@@ -92,14 +90,15 @@ def open_image_folder_fnames(source_dir: str, *, max_images: Optional[int]):
     return max_idx, out
 
 
-def apply_transform(img: np.ndarray, resolution: int) -> Optional[np.ndarray]:
+def apply_transform(img: np.ndarray, height: int, width: int) -> Optional[np.ndarray]:
     """
-    Apply a transform to `img` and return the resulting array (H, W, 3).
-    Return None if we want to skip the image for any reason.
+    Resize image to the requested rectangular resolution.
     """
     if img is None:
         return None
-    return center_crop_arr(img, resolution)
+    if img.shape[0] == height and img.shape[1] == width:
+        return img
+    return np.array(Image.fromarray(img).resize((width, height), resample=Image.BICUBIC))
 
 
 def read_image(input_: str) -> np.ndarray:
@@ -120,17 +119,17 @@ def _process_single_image(args):
         4) Encode as an uncompressed PNG (in-memory).
         5) Return a tuple: (arcname, image bytes, label).
     """
-    global_idx, (input_, label), resolution, check_dims = args
+    global_idx, (input_, label), height, width, check_dims = args
 
     # 1) Read
     img = read_image(input_)
     if img is None:
-        return (global_idx, None)  # skip if it fails to load
+        return (global_idx, None)
 
     # 2) Transform
-    img = apply_transform(img, resolution)
+    img = apply_transform(img, height, width)
     if img is None:
-        return (global_idx, None)  # skip if transform returns None
+        return (global_idx, None)
 
     # 3) Check dimensions
     exp_w = check_dims["width"]
@@ -172,11 +171,13 @@ def create_dataset_in_group(h5file, full_path, data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--imagenet-path", type=str, required=True,
-                        help="Path to the ImageNet dataset")
+                        help="Path to the image dataset")
     parser.add_argument("--output-path", type=str, default="data",
                         help="Path to the output HDF5 file")
-    parser.add_argument("--resolution", type=int, default=256,
-                        help="Preprocessing image resolution")
+    parser.add_argument("--height", type=int, default=512,
+                        help="Preprocessing image height")
+    parser.add_argument("--width", type=int, default=384,
+                        help="Preprocessing image width")
     parser.add_argument("--num-workers", type=int, default=16,
                         help="Number of workers to use")
     parser.add_argument("--max-images", type=int, default=None,
@@ -201,24 +202,22 @@ if __name__ == "__main__":
     sample_arr = read_image(sample_fname)
     if sample_arr is None:
         raise ValueError("First sample image failed to load.")
-    sample_arr = apply_transform(sample_arr, args.resolution)
+    sample_arr = apply_transform(sample_arr, args.height, args.width)
     if sample_arr is None:
         raise ValueError("The first sample transform returned None.")
     h, w, c = sample_arr.shape
-    if w != h:
-        raise ValueError(f"Images must be square after transform; got {w}x{h}.")
-    if w & (w - 1):
-        raise ValueError("Width/height must be a power-of-two after transform.")
+    if h != args.height or w != args.width:
+        raise ValueError(f"Expected {args.width}x{args.height}, got {w}x{h}.")
 
     check_dims = {"width": w, "height": h}
 
     # Prepare tasks for each image.
     tasks = []
     for i, (inp, lbl) in enumerate(file_label_pairs):
-        tasks.append((i, (inp, lbl), args.resolution, check_dims))
+        tasks.append((i, (inp, lbl), args.height, args.width, check_dims))
 
     # Process images in parallel and write directly to the HDF5 file.
-    metadata = []  # to store [arcname, label] pairs
+    metadata = []
     with h5py.File(h5_path, "w") as h5f:
         with multiprocessing.Pool(processes=args.num_workers) as pool:
             for global_idx, data in tqdm(
@@ -232,6 +231,7 @@ if __name__ == "__main__":
                 create_dataset_in_group(h5f, arcname, img_bytes)
                 if lbl is not None:
                     metadata.append([arcname, lbl])
+
         # Write dataset.json containing the metadata into the HDF5 file.
         dataset_json = json.dumps({"labels": metadata}).encode("utf-8")
         create_dataset_in_group(h5f, "dataset.json", dataset_json)
