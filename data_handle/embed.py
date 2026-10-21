@@ -17,7 +17,8 @@ from torchvision import transforms
 
 
 def seed_worker(worker_id: int) -> None:
-    worker_seed = torch.initial_seed() % 2**32
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
@@ -153,17 +154,20 @@ class LatentMemmapCache:
         self.latent = None
         self.mean = None
         self.logvar = None
+
         full_shape = (num_samples, *spec.shape)
 
         if spec.cache_type == "fixed":
             if spec.latent_path is None:
                 raise ValueError("Fixed latent cache requires latent_path.")
             self.latent = np.memmap(spec.latent_path, mode="r", dtype=spec.dtype, shape=full_shape)
+
         elif spec.cache_type == "posterior":
             if spec.mean_path is None or spec.logvar_path is None:
                 raise ValueError("Posterior cache requires mean_path and logvar_path.")
             self.mean = np.memmap(spec.mean_path, mode="r", dtype=spec.dtype, shape=full_shape)
             self.logvar = np.memmap(spec.logvar_path, mode="r", dtype=spec.dtype, shape=full_shape)
+
         else:
             raise ValueError(f"Unknown latent cache type: {spec.cache_type}")
 
@@ -194,6 +198,7 @@ class LatentMemmapCache:
 
         assert self.mean is not None
         assert self.logvar is not None
+
         mean = np.array(self.mean[cache_idx], dtype=np.float32, copy=True)
 
         if not sample_posterior:
@@ -246,15 +251,18 @@ def validate_parents(parents: list[str] | tuple[str, ...] | None) -> list[str]:
 
     allowed = list(get_type_hints(Metadata).keys())
     invalid = [p for p in parents if p not in allowed]
+
     if invalid:
         raise ValueError(f"Invalid parent(s): {invalid}. Allowed: {allowed}")
 
     seen = set()
     out = []
+
     for p in parents:
         if p not in seen:
             seen.add(p)
             out.append(p)
+
     return out
 
 
@@ -284,6 +292,7 @@ def validate_cache_idx(df: pd.DataFrame, split: str) -> None:
         raise ValueError(f"Latent mode requires 'cache_idx' in {split}.csv.")
 
     cache_idx = df["cache_idx"].to_numpy()
+
     try:
         cache_idx_int = cache_idx.astype(np.int64)
     except Exception as e:
@@ -291,11 +300,13 @@ def validate_cache_idx(df: pd.DataFrame, split: str) -> None:
 
     if not np.array_equal(cache_idx, cache_idx_int):
         raise ValueError(f"{split}.csv cache_idx must contain integer values.")
+
     if len(np.unique(cache_idx_int)) != len(cache_idx_int):
         raise ValueError(f"{split}.csv cache_idx must be unique.")
 
     expected = np.arange(len(df), dtype=np.int64)
     actual = np.sort(cache_idx_int)
+
     if not np.array_equal(expected, actual):
         raise ValueError(
             f"{split}.csv cache_idx must cover exactly 0..N-1. "
@@ -321,10 +332,12 @@ def load_latent_cache_meta(cache_dir: str | os.PathLike) -> dict:
 
 def resolve_cache_path(cache_dir: Path, saved_file: str) -> Path:
     saved_path = Path(saved_file)
+
     if saved_path.exists():
         return saved_path
 
     moved_path = cache_dir / saved_path.name
+
     if moved_path.exists():
         return moved_path
 
@@ -344,6 +357,7 @@ def load_latent_cache_spec(cache_dir: str | os.PathLike, split: str, stats_split
         "mean_file": "...mean_train.dat"
         "logvar_file": "...logvar_train.dat"
     """
+
     cache_dir = Path(cache_dir)
     meta = load_latent_cache_meta(cache_dir)
 
@@ -351,13 +365,16 @@ def load_latent_cache_spec(cache_dir: str | os.PathLike, split: str, stats_split
         raise ValueError("latent_cache_meta.json does not contain 'splits'.")
 
     splits = meta["splits"]
+
     if split not in splits:
         raise ValueError(f"Split {split!r} not found in latent cache metadata. Available: {list(splits.keys())}")
+
     if stats_split not in splits:
         raise ValueError(f"Stats split {stats_split!r} not found in latent cache metadata.")
 
     split_meta = splits[split]
     stats_meta = splits[stats_split]
+
     latent_path = None
     mean_path = None
     logvar_path = None
@@ -372,9 +389,11 @@ def load_latent_cache_spec(cache_dir: str | os.PathLike, split: str, stats_split
         cache_type = "posterior"
         mean_path = resolve_cache_path(cache_dir, split_meta["mean_file"])
         logvar_path = resolve_cache_path(cache_dir, split_meta["logvar_file"])
+
     elif has_fixed:
         cache_type = "fixed"
         latent_path = resolve_cache_path(cache_dir, split_meta["file"])
+
     else:
         raise ValueError(
             f"No supported cache entry for split={split}. "
@@ -398,10 +417,13 @@ def load_latent_cache_spec(cache_dir: str | os.PathLike, split: str, stats_split
 
     if mean is None or std is None:
         raise ValueError(f"Missing per_channel_mean / per_channel_std in stats split={stats_split}.")
+
     if len(mean) != c:
         raise ValueError(f"Mean/channel mismatch: C={c}, len(mean)={len(mean)}")
+
     if len(std) != c:
         raise ValueError(f"Std/channel mismatch: C={c}, len(std)={len(std)}")
+
     if any(float(s) <= 0 for s in std):
         raise ValueError("Latent std contains non-positive values.")
 
@@ -444,8 +466,10 @@ def get_metadata(row: pd.Series, normalize_age: bool = True) -> Metadata:
 
 def load_image(root: str | os.PathLike | None, row: pd.Series) -> np.ndarray:
     image_path = row["image_path"]
+
     if root is not None and not os.path.isabs(str(image_path)):
         image_path = os.path.join(root, image_path)
+
     return preprocess_breast(image_path)
 
 
@@ -456,8 +480,10 @@ def get_sample(
     normalize_age: bool = True,
 ) -> tuple[np.ndarray, Metadata] | Metadata:
     metadata = get_metadata(row, normalize_age=normalize_age)
+
     if not return_image:
         return metadata
+
     return load_image(root, row), metadata
 
 
@@ -467,10 +493,13 @@ def get_sample(
 
 def encode_parent_metadata(metadata: Metadata, parents: list[str]) -> dict[str, Tensor]:
     pa = {}
+
     for k in parents:
         spec = CLASS_SCHEMA.get(k)
+
         if isinstance(spec, int) and spec > 0:
             value = int(metadata[k])
+
             if not 0 <= value < spec:
                 raise ValueError(f"Invalid categorical value for {k}: {value}. Expected [0, {spec - 1}].")
 
@@ -479,6 +508,7 @@ def encode_parent_metadata(metadata: Metadata, parents: list[str]) -> dict[str, 
             pa[k] = one_hot
         else:
             pa[k] = torch.as_tensor(metadata[k], dtype=torch.float32).unsqueeze(0)
+
     return pa
 
 
@@ -499,6 +529,7 @@ class EMBED(torch.utils.data.Dataset):
         latent_sampling: str = "sample_train",
     ):
         super().__init__()
+
         self.root = root
         self.df = df.reset_index(drop=True)
         self.split = split
@@ -521,6 +552,7 @@ class EMBED(torch.utils.data.Dataset):
                 )
 
             c, h, w = self.cache_spec.shape
+
             if self.cache_spec.cache_type == "posterior":
                 sampling = describe_latent_sampling(self.latent_sampling, split)
                 print(
@@ -551,40 +583,45 @@ class EMBED(torch.utils.data.Dataset):
         while True:
             try:
                 row = self.df.iloc[idx]
-                image, metadata = get_sample(
-                    self.root, row, return_image=True, normalize_age=self.normalize_age
-                )
+                image, metadata = get_sample(self.root, row, return_image=True, normalize_age=self.normalize_age)
                 return image, metadata, row
             except (OSError, RuntimeError, FileNotFoundError):
                 idx = random.randrange(len(self))
 
     def _load_latent_item(self, idx: int) -> tuple[np.ndarray, Metadata, pd.Series]:
         self._maybe_get_cache()
+
         assert self.cache is not None
         assert self.cache_spec is not None
 
         row = self.df.iloc[idx]
         cache_idx = int(row["cache_idx"])
+
         sample_posterior = should_sample_posterior(self.latent_sampling, self.split)
         latent = self.cache.load(cache_idx, sample_posterior)
-        metadata = get_sample(
-            self.root, row, return_image=False, normalize_age=self.normalize_age
-        )
+
+        metadata = get_sample(self.root, row, return_image=False, normalize_age=self.normalize_age)
+
         return latent, metadata, row
 
     def __getitem__(self, idx: int) -> dict:
         if self.cache_spec is not None:
             x_np, metadata, row = self._load_latent_item(idx)
+
             if x_np.ndim < 3:
                 x_np = x_np[None, ...]
 
             x = torch.from_numpy(x_np).float()
+
             if self.transform is not None:
                 x = self.transform(x)
+
             if not torch.isfinite(x).all():
                 raise ValueError(f"Latent contains NaN/Inf for idx={idx}")
+
         else:
             x_np, metadata, row = self._load_image_item(idx)
+
             if self.transform is not None:
                 x = self.transform(x_np)
             else:
@@ -592,12 +629,20 @@ class EMBED(torch.utils.data.Dataset):
                     x_np = x_np[None, ...]
                 x = torch.from_numpy(x_np).float().div(255.0)
 
-            assert x.max() <= 1.0 and x.min() >= 0.0, (
-                f"Expected image values in [0,1], got [{x.min().item()}, {x.max().item()}]"
-            )
+            if not torch.isfinite(x).all():
+                raise ValueError(f"Image contains NaN/Inf for idx={idx}")
+
+            x_min = x.min().item()
+            x_max = x.max().item()
+
+            if x_min < -1e-6 or x_max > 1.0 + 1e-6:
+                raise ValueError(f"Expected image values in [0,1], got [{x_min}, {x_max}]")
+
+            x = x.clamp(0.0, 1.0)
 
         pa = encode_parent_metadata(metadata, self.parents)
         shortpath = str(row["shortpath"]) if "shortpath" in row.index else str(row["image_path"])
+
         out = {"x": x, "pa": pa, "shortpath": shortpath}
 
         if "cache_idx" in row.index:
@@ -651,6 +696,7 @@ def get_embed(cfg: DatasetConfig) -> dict[str, EMBED]:
         raise ValueError("cfg.split_dir must be provided.")
 
     validate_latent_sampling(cfg.latent_sampling)
+
     parents = validate_parents(cfg.parents)
     split_dfs = load_split_csvs(cfg.split_dir)
     latent_mode = is_latent_mode(cfg)
@@ -675,6 +721,7 @@ def get_embed(cfg: DatasetConfig) -> dict[str, EMBED]:
         )
         for split in ["train", "valid", "test"]
     }
+
     return datasets
 
 
@@ -687,6 +734,7 @@ def get_dataloaders(
     datasets: dict[str, EMBED],
 ) -> dict[str, torch.utils.data.DataLoader]:
     is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+
     if is_dist:
         from torch.utils.data.distributed import DistributedSampler
 
@@ -715,6 +763,7 @@ def get_dataloaders(
             worker_init_fn=seed_worker,
             generator=g,
         )
+
         if cfg.num_workers > 0:
             kwargs["prefetch_factor"] = cfg.prefetch_factor
             kwargs["persistent_workers"] = True
@@ -749,7 +798,12 @@ def main() -> None:
 
     parser.add_argument("--normalize_age", type=int, default=1)
     parser.add_argument("--normalize_latents", type=int, default=1)
-    parser.add_argument("--latent_sampling", type=str, default="sample_train", choices=["fixed_mean", "sample_train", "sample_all"])
+    parser.add_argument(
+        "--latent_sampling",
+        type=str,
+        default="sample_train",
+        choices=["fixed_mean", "sample_train", "sample_all"],
+    )
 
     args = parser.parse_args()
 
@@ -766,6 +820,7 @@ def main() -> None:
         normalize_latents=bool(args.normalize_latents),
         latent_sampling=args.latent_sampling,
     )
+
     loader_cfg = DataLoaderConfig(
         bs=args.bs,
         num_workers=args.num_workers,
@@ -779,6 +834,7 @@ def main() -> None:
 
     batch = next(iter(dataloaders["train"]))
     expected_shape = (args.bs, args.img_channels, args.img_height, args.img_width)
+
     assert batch["x"].shape == expected_shape, (
         f"Expected {expected_shape}, got {tuple(batch['x'].shape)}"
     )

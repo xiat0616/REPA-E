@@ -7,12 +7,15 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import wandb
 from PIL import Image
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torch.utils.data import DataLoader
 from torchvision.transforms import Normalize
@@ -51,10 +54,130 @@ def preprocess_raw_image(x, enc_type):
 
 
 def array2grid(x, nrow=None):
+    if x.shape[1] != 1:
+        x = x.mean(dim=1, keepdim=True)
     if nrow is None:
         nrow = max(1, round(math.sqrt(x.size(0))))
     x = make_grid(x.clamp(0, 1), nrow=nrow, value_range=(0, 1))
-    return x.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+    x = x[0]
+    return x.mul(255).add_(0.5).clamp_(0, 255).to('cpu', torch.uint8).numpy()
+
+
+def _show_image(ax, img):
+    img = img.detach().cpu()
+
+    if img.ndim != 3:
+        raise ValueError(f'Expected CHW image, got {tuple(img.shape)}.')
+
+    if img.shape[0] == 1:
+        ax.imshow(img[0], cmap='gray', vmin=0, vmax=1)
+    else:
+        ax.imshow(img.mean(dim=0), cmap='gray', vmin=0, vmax=1)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _show_difference(ax, original, output):
+    diff = (output - original).detach().cpu()
+
+    if diff.ndim != 3:
+        raise ValueError(f'Expected CHW difference image, got {tuple(diff.shape)}.')
+
+    if diff.shape[0] == 1:
+        diff = diff[0]
+    else:
+        diff = diff.mean(dim=0)
+
+    # Match the previous plotting code:
+    # signed intensity difference on approximately [-255, 255].
+    diff = diff * 255.0
+
+    amax = float(diff.abs().max())
+    if amax == 0:
+        amax = 1.0
+
+    effect = ax.imshow(
+        diff,
+        cmap='RdBu_r',
+        vmin=-amax,
+        vmax=amax,
+    )
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes('bottom', size='4%', pad=0.06)
+    cbar = ax.figure.colorbar(effect, cax=cax, orientation='horizontal')
+    cbar.outline.set_visible(False)
+    cbar.ax.tick_params(labelsize=7, pad=1)
+
+    ticks = np.linspace(np.ceil(-amax), np.floor(amax), 5)
+    cbar.set_ticks(np.round(ticks))
+
+
+def _comparison_figure_to_array(originals, outputs, output_labels):
+    originals = originals.detach().cpu()
+    outputs = [x.detach().cpu() for x in outputs]
+
+    if len(outputs) != len(output_labels):
+        raise ValueError('outputs and output_labels must have the same length.')
+
+    n = originals.shape[0]
+    nrows = 1 + 2 * len(outputs)
+
+    fig, axes = plt.subplots(
+        nrows,
+        n,
+        figsize=(2.8 * n, 2.8 * nrows),
+        squeeze=False,
+    )
+
+    for j in range(n):
+        _show_image(axes[0, j], originals[j])
+        if j == 0:
+            axes[0, j].set_ylabel('Original', fontsize=10, labelpad=10)
+
+    for i, (output, label) in enumerate(zip(outputs, output_labels)):
+        image_row = 1 + 2 * i
+        diff_row = image_row + 1
+
+        for j in range(n):
+            _show_image(axes[image_row, j], output[j])
+            _show_difference(
+                axes[diff_row, j],
+                originals[j],
+                output[j],
+            )
+
+            if j == 0:
+                axes[image_row, j].set_ylabel(label, fontsize=10, labelpad=10)
+                axes[diff_row, j].set_ylabel(
+                    f'{label}\n- Original',
+                    fontsize=10,
+                    labelpad=10,
+                )
+
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.995,
+        top=0.995,
+        bottom=0.01,
+        wspace=0.05,
+        hspace=0.18,
+    )
+
+    fig.canvas.draw()
+    array = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    plt.close(fig)
+    return array
 
 
 def append_jsonl(path, row):
@@ -105,10 +228,10 @@ def original_model(accelerator, model, compiled=False):
 def batch_to_parents(batch, device):
     pa = batch['pa']
     return {
-        'age': pa['age'].to(device),
-        'view': pa['view'].argmax(dim=1).long().to(device),
-        'density': pa['density'].argmax(dim=1).long().to(device),
-        'scanner': pa['scanner'].argmax(dim=1).long().to(device),
+        'age': pa['age'].float().to(device),
+        'view': pa['view'].float().to(device),
+        'density': pa['density'].float().to(device),
+        'scanner': pa['scanner'].float().to(device),
     }
 
 
@@ -116,28 +239,50 @@ def slice_parents(parents, n):
     return {k: v[:n] for k, v in parents.items()}
 
 
+def make_counterfactual_parents(parents, attr):
+    cf = {k: v.clone() for k, v in parents.items()}
+
+    if attr == 'view':
+        cf['view'] = torch.roll(cf['view'], shifts=1, dims=1)
+    elif attr == 'density':
+        cf['density'] = torch.roll(cf['density'], shifts=1, dims=1)
+    elif attr == 'scanner':
+        cf['scanner'] = torch.roll(cf['scanner'], shifts=1, dims=1)
+    elif attr == 'age':
+        age = cf['age']
+        cf['age'] = torch.where(age <= 0.9, age + 0.1, age - 0.1).clamp(0, 1)
+    else:
+        raise ValueError(f'Unknown counterfactual attribute: {attr}')
+
+    return cf
+
+
 @torch.no_grad()
 def extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator):
     zs = []
-
     with accelerator.autocast():
         for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
             raw_image_ = preprocess_raw_image(raw_image, encoder_type)
             z = encoder.forward_features(raw_image_)
-
             if 'mocov3' in encoder_type:
                 z = z[:, 1:]
-
             if 'dinov2' in encoder_type:
                 z = z['x_norm_patchtokens']
-
             zs.append(z)
-
     return zs
 
 
 @torch.no_grad()
+def encode_vae_latent(vae, raw_image):
+    processed_image = preprocess_imgs_vae(raw_image)
+    with torch.autocast(device_type=raw_image.device.type, enabled=False):
+        _, z, _ = vae(processed_image.float())
+    return z.float()
+
+
+@torch.no_grad()
 def validate_sit(model, vae, val_dataloader, encoders, encoder_types, architectures, accelerator, args):
+    use_repa = args.proj_coeff > 0
     model.eval()
     vae.eval()
     sums = torch.zeros(4, device=accelerator.device, dtype=torch.float32)
@@ -148,22 +293,25 @@ def validate_sit(model, vae, val_dataloader, encoders, encoder_types, architectu
 
         raw_image = batch['x'].to(accelerator.device).repeat(1, 3, 1, 1) * 255.0
         parents = batch_to_parents(batch, accelerator.device)
-        zs = extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator)
+        zs = extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator) if use_repa else None
+        z = encode_vae_latent(vae, raw_image)
 
         with accelerator.autocast():
-            processed_image = preprocess_imgs_vae(raw_image)
-            _, z, _ = vae(processed_image)
-
             outputs = model(
                 x=z,
                 parents=parents,
                 zs=zs,
-                loss_kwargs=dict(weighting=args.weighting, path_type=args.path_type, prediction=args.prediction, align_only=False),
+                loss_kwargs=dict(
+                    weighting=args.weighting,
+                    path_type=args.path_type,
+                    prediction=args.prediction,
+                    align_only=False,
+                ),
             )
 
             denoise = outputs['denoising_loss'].mean()
             proj = outputs['proj_loss'].mean()
-            total = denoise + args.proj_coeff * proj
+            total = denoise + args.proj_coeff * proj if use_repa else denoise
 
         sums += torch.stack([total.float(), denoise.float(), proj.float(), torch.ones((), device=sums.device)])
 
@@ -181,12 +329,174 @@ def validate_sit(model, vae, val_dataloader, encoders, encoder_types, architectu
 
 
 @torch.no_grad()
+def flow_euler(model, x, parents, t_start, t_end, num_steps):
+    timesteps = torch.linspace(t_start, t_end, num_steps + 1, device=x.device, dtype=x.dtype)
+
+    for i in range(num_steps):
+        t = torch.full((x.shape[0],), timesteps[i], device=x.device, dtype=x.dtype)
+        dt = timesteps[i + 1] - timesteps[i]
+        velocity = model.inference(x, t, parents)
+        x = x + dt * velocity
+
+    return x
+
+
+@torch.no_grad()
+def encode_flow_input(ema, vae, images):
+    raw_image = images.repeat(1, 3, 1, 1) * 255.0
+    processed_image = preprocess_imgs_vae(raw_image)
+
+    with torch.autocast(device_type=raw_image.device.type, enabled=False):
+        posterior, _, _ = vae(processed_image.float())
+        z = posterior.mode().float()
+
+    return ema.bn(z)
+
+
+@torch.no_grad()
+def decode_flow_latent(ema, vae, z):
+    latents_stats = ema.extract_latents_stats()
+    in_channels = z.shape[1]
+    latents_scale = latents_stats['latents_scale'].view(1, in_channels, 1, 1)
+    latents_bias = latents_stats['latents_bias'].view(1, in_channels, 1, 1)
+    z = denormalize_latents(z.float(), latents_scale, latents_bias)
+
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        images = vae.decode(z.float()).sample
+
+    images = images.mean(dim=1, keepdim=True)
+    return ((images + 1.) / 2.).clamp(0, 1)
+
+
+@torch.no_grad()
+def make_flow_reconstruction_grid(ema, vae, val_dataloader, accelerator, args):
+    ema.eval()
+    vae.eval()
+
+    batch = next(iter(val_dataloader))
+    original = batch['x'].to(accelerator.device)
+    parents = batch_to_parents(batch, accelerator.device)
+
+    n = min(original.shape[0], args.num_recon_images)
+    original = original[:n]
+    parents = slice_parents(parents, n)
+
+    z0 = encode_flow_input(ema, vae, original)
+
+    zT = flow_euler(
+        ema,
+        z0,
+        parents,
+        t_start=0.0,
+        t_end=1.0,
+        num_steps=args.reconstruction_num_steps,
+    )
+
+    z_recon = flow_euler(
+        ema,
+        zT,
+        parents,
+        t_start=1.0,
+        t_end=0.0,
+        num_steps=args.reconstruction_num_steps,
+    )
+
+    recon = decode_flow_latent(ema, vae, z_recon)
+
+    originals = accelerator.gather(original.float())
+    recons = accelerator.gather(recon.float())
+
+    if not accelerator.is_main_process:
+        return None
+
+    n = min(args.num_recon_images, originals.shape[0], recons.shape[0])
+    originals = originals[:n]
+    recons = recons[:n]
+
+    return _comparison_figure_to_array(
+        originals=originals,
+        outputs=[recons],
+        output_labels=['Reconstruction'],
+    )
+
+
+@torch.no_grad()
+def make_counterfactual_grid(ema, vae, val_dataloader, accelerator, args):
+    ema.eval()
+    vae.eval()
+
+    batch = next(iter(val_dataloader))
+    original = batch['x'].to(accelerator.device)
+    parents = batch_to_parents(batch, accelerator.device)
+
+    n = min(original.shape[0], args.num_counterfactual_images)
+    original = original[:n]
+    parents = slice_parents(parents, n)
+
+    z0 = encode_flow_input(ema, vae, original)
+
+    # Abduction: invert once using factual parents.
+    zT = flow_euler(
+        ema,
+        z0,
+        parents,
+        t_start=0.0,
+        t_end=1.0,
+        num_steps=args.counterfactual_num_steps,
+    )
+
+    counterfactuals = []
+
+    for attr in ['view', 'density', 'scanner', 'age']:
+        cf_parents = make_counterfactual_parents(parents, attr)
+
+        z_cf = flow_euler(
+            ema,
+            zT,
+            cf_parents,
+            t_start=1.0,
+            t_end=0.0,
+            num_steps=args.counterfactual_num_steps,
+        )
+
+        counterfactuals.append(decode_flow_latent(ema, vae, z_cf))
+
+    originals = accelerator.gather(original.float())
+    counterfactuals = [accelerator.gather(x.float()) for x in counterfactuals]
+
+    if not accelerator.is_main_process:
+        return None
+
+    n = min(
+        args.num_counterfactual_images,
+        originals.shape[0],
+        *[x.shape[0] for x in counterfactuals],
+    )
+
+    originals = originals[:n]
+    counterfactuals = [x[:n] for x in counterfactuals]
+
+    return _comparison_figure_to_array(
+        originals=originals,
+        outputs=counterfactuals,
+        output_labels=[
+            'View CF',
+            'Density CF',
+            'Scanner CF',
+            'Age CF',
+        ],
+    )
+
+
+@torch.no_grad()
 def generate_ema_samples(ema, vae, xT, parents, in_channels, accelerator, args):
     ema.eval()
     vae.eval()
 
     samples = euler_sampler(
-        ema, xT, parents,
+        ema,
+        xT,
+        parents,
         num_steps=args.sample_num_steps,
         cfg_scale=args.sample_cfg_scale,
         guidance_low=0.,
@@ -200,7 +510,9 @@ def generate_ema_samples(ema, vae, xT, parents, in_channels, accelerator, args):
     latents_bias = latents_stats['latents_bias'].view(1, in_channels, 1, 1)
 
     samples = vae.decode(denormalize_latents(samples, latents_scale, latents_bias)).sample
+    samples = samples.mean(dim=1, keepdim=True)
     samples = (samples + 1) / 2.
+
     return accelerator.gather(samples.to(torch.float32))
 
 
@@ -217,11 +529,15 @@ def main(args):
     save_dir = os.path.join(args.output_dir, args.exp_name)
     checkpoint_dir = os.path.join(save_dir, 'checkpoints')
     sample_dir = os.path.join(save_dir, 'samples')
+    recon_dir = os.path.join(save_dir, 'reconstructions')
+    counterfactual_dir = os.path.join(save_dir, 'counterfactuals')
     validation_path = os.path.join(save_dir, 'validation_metrics.jsonl')
 
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(sample_dir, exist_ok=True)
+        os.makedirs(recon_dir, exist_ok=True)
+        os.makedirs(counterfactual_dir, exist_ok=True)
 
         with open(os.path.join(save_dir, 'args.json'), 'w') as f:
             json.dump(vars(args), f, indent=4)
@@ -252,8 +568,14 @@ def main(args):
     else:
         raise NotImplementedError()
 
-    encoders, encoder_types, architectures = load_encoders(args.enc_type, device, image_size)
-    z_dims = [encoder.embed_dim for encoder in encoders]
+    use_repa = args.proj_coeff > 0
+
+    if use_repa:
+        encoders, encoder_types, architectures = load_encoders(args.enc_type, device, image_size)
+        z_dims = [encoder.embed_dim for encoder in encoders]
+    else:
+        encoders, encoder_types, architectures = [], [], []
+        z_dims = []
 
     model = SiT_models[args.model](
         input_size=latent_size,
@@ -269,10 +591,37 @@ def main(args):
     ema = copy.deepcopy(model).to(device)
     requires_grad(ema, False)
 
-    latents_stats = torch.load(args.vae_ckpt.replace('.pt', '-latents-stats.pt'), map_location='cpu')
-    latents_scale = latents_stats['latents_scale'].squeeze().to(device)
-    latents_bias = latents_stats['latents_bias'].squeeze().to(device)
+    stats_path = Path(args.vae_ckpt).parent / f'embed_{args.vae}_{args.height}x{args.width}_latent_stats.pt'
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            f'Latent statistics not found: {stats_path}\n'
+            f'Run compute_embed_latent_stats.py for {args.height}x{args.width} first.'
+        )
+
+    latents_stats = torch.load(stats_path, map_location='cpu')
+    if 'mean' not in latents_stats or 'std' not in latents_stats:
+        raise KeyError(f'Latent statistics file must contain mean and std: {stats_path}')
+
+    latents_bias = latents_stats['mean'].squeeze().float()
+    latents_std = latents_stats['std'].squeeze().float()
+
+    if latents_bias.numel() != in_channels or latents_std.numel() != in_channels:
+        raise ValueError(
+            f'Latent statistics channel mismatch: model expects {in_channels} channels, '
+            f'but stats contain mean={latents_bias.numel()}, std={latents_std.numel()}.'
+        )
+
+    if not torch.isfinite(latents_bias).all() or not torch.isfinite(latents_std).all() or (latents_std <= 0).any():
+        raise ValueError(f'Invalid latent statistics in {stats_path}')
+
+    latents_bias = latents_bias.to(device)
+    latents_scale = latents_std.reciprocal().to(device)
     model.init_bn(latents_bias=latents_bias, latents_scale=latents_scale)
+
+    if accelerator.is_main_process:
+        run_logger.info(f'Loaded latent statistics from {stats_path}')
+        run_logger.info(f'Latent bias: {latents_bias.detach().cpu()}')
+        run_logger.info(f'Latent scale: {latents_scale.detach().cpu()}')
 
     vae = vae_models[args.vae]().to(device)
     vae_ckpt = torch.load(args.vae_ckpt, map_location=device)
@@ -281,6 +630,7 @@ def main(args):
 
     requires_grad(vae, False)
     vae.eval()
+    vae.float()
 
     if accelerator.use_distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -300,6 +650,16 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    if args.lr_warmup_steps > 0:
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0 / args.lr_warmup_steps,
+            end_factor=1.0,
+            total_iters=args.lr_warmup_steps,
+        )
+    else:
+        lr_scheduler = None
+
     dataset_cfg = DatasetConfig(
         data_dir=args.data_dir,
         split_dir=args.split_dir,
@@ -312,6 +672,12 @@ def main(args):
 
     datasets = get_embed(dataset_cfg)
     local_batch_size = int(args.batch_size // accelerator.num_processes)
+
+    if local_batch_size < 1 or args.batch_size % accelerator.num_processes != 0:
+        raise ValueError(
+            f'--batch-size ({args.batch_size}) must be divisible by number of processes '
+            f'({accelerator.num_processes}).'
+        )
 
     train_dataloader = DataLoader(
         datasets['train'],
@@ -333,6 +699,7 @@ def main(args):
 
     if accelerator.is_main_process:
         run_logger.info(f"Train: {len(datasets['train']):,} | Valid: {len(datasets['valid']):,}")
+        run_logger.info(f'Global batch: {args.batch_size} | Local batch/GPU: {local_batch_size}')
 
     update_ema(ema, model, decay=0)
     model.eval()
@@ -344,13 +711,19 @@ def main(args):
         if args.continue_train_exp_dir is None:
             raise ValueError('--continue-train-exp-dir is required when --resume-step > 0.')
 
-        ckpt_path = f"{args.continue_train_exp_dir}/checkpoints/{args.resume_step:07d}.pt"
+        ckpt_path = f'{args.continue_train_exp_dir}/checkpoints/{args.resume_step:07d}.pt'
         ckpt = torch.load(ckpt_path, map_location='cpu')
 
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
+        if lr_scheduler is not None and ckpt.get('scheduler') is not None:
+            lr_scheduler.load_state_dict(ckpt['scheduler'])
         global_step = ckpt['steps']
+
+        # Keep latent normalization tied to the current dataset/resolution stats.
+        model.init_bn(latents_bias=latents_bias, latents_scale=latents_scale)
+        ema.init_bn(latents_bias=latents_bias, latents_scale=latents_scale)
 
     torch._dynamo.config.cache_size_limit = 64
     torch._dynamo.config.accumulated_cache_size_limit = 512
@@ -358,7 +731,9 @@ def main(args):
     if args.compile:
         model = torch.compile(model, backend='inductor', mode='default')
 
-    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(model, optimizer, train_dataloader, val_dataloader)
+    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader
+    )
 
     if accelerator.is_main_process:
         accelerator.init_trackers(
@@ -393,15 +768,21 @@ def main(args):
         for batch in train_dataloader:
             raw_image = batch['x'].to(device).repeat(1, 3, 1, 1) * 255.0
             parents = batch_to_parents(batch, device)
-            zs = extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator)
+
+            zs = (
+                extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator)
+                if use_repa else None
+            )
+
+            z = encode_vae_latent(vae, raw_image)
+
+            if not torch.isfinite(z).all():
+                raise FloatingPointError(f'Non-finite VAE latent at step {global_step + 1}.')
 
             with accelerator.accumulate(model), accelerator.autocast():
                 model.train()
-                original_model(accelerator, model, args.compile).bn.eval()
-
-                with torch.no_grad():
-                    processed_image = preprocess_imgs_vae(raw_image)
-                    _, z, _ = vae(processed_image)
+                base_model = original_model(accelerator, model, args.compile)
+                base_model.bn.eval()
 
                 sit_outputs = model(
                     x=z,
@@ -415,13 +796,41 @@ def main(args):
                     ),
                 )
 
-                sit_loss = sit_outputs['denoising_loss'].mean() + args.proj_coeff * sit_outputs['proj_loss'].mean()
+                denoising_loss = sit_outputs['denoising_loss'].mean()
+                proj_loss = sit_outputs['proj_loss'].mean()
+                sit_loss = denoising_loss + args.proj_coeff * proj_loss if use_repa else denoising_loss
+
+                if not torch.isfinite(sit_loss):
+                    raise FloatingPointError(
+                        f'Non-finite loss at step {global_step + 1}: '
+                        f'denoise={denoising_loss.item()}, proj={proj_loss.item()}'
+                    )
+
                 accelerator.backward(sit_loss)
+
+                base_model = original_model(accelerator, model, args.compile)
+                for name, p in base_model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        finite = p.grad[torch.isfinite(p.grad)]
+                        finite_max = finite.abs().max().item() if finite.numel() else float('nan')
+                        raise FloatingPointError(
+                            f'Non-finite gradient at step {global_step + 1}: '
+                            f'{name}, shape={tuple(p.shape)}, finite_absmax={finite_max}'
+                        )
 
                 if accelerator.sync_gradients:
                     grad_norm_sit = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
+                    if not torch.isfinite(torch.as_tensor(grad_norm_sit, device=device)):
+                        raise FloatingPointError(
+                            f'Non-finite gradient norm at step {global_step + 1}: {grad_norm_sit}'
+                        )
+
                 optimizer.step()
+
+                if accelerator.sync_gradients and lr_scheduler is not None:
+                    lr_scheduler.step()
+
                 optimizer.zero_grad(set_to_none=True)
 
                 if accelerator.sync_gradients:
@@ -432,10 +841,12 @@ def main(args):
                 global_step += 1
 
                 logs = {
-                    'train/sit_loss': accelerator.gather(sit_loss).mean().detach().item(),
-                    'train/denoising_loss': accelerator.gather(sit_outputs['denoising_loss']).mean().detach().item(),
-                    'train/proj_loss': accelerator.gather(sit_outputs['proj_loss']).mean().detach().item(),
-                    'train/grad_norm_sit': accelerator.gather(grad_norm_sit).mean().detach().item(),
+                    'train/sit_loss': accelerator.gather(sit_loss.detach().reshape(1)).mean().item(),
+                    'train/denoising_loss': accelerator.gather(sit_outputs['denoising_loss'].detach()).mean().item(),
+                    'train/proj_loss': accelerator.gather(proj_loss.detach().reshape(1)).mean().item(),
+                    'train/grad_norm_sit': accelerator.gather(
+                        torch.as_tensor(grad_norm_sit, device=device).detach().reshape(1)
+                    ).mean().item(),
                     'epoch': epoch,
                 }
 
@@ -454,6 +865,7 @@ def main(args):
                         'model': base_model.state_dict(),
                         'ema': ema.state_dict(),
                         'opt': optimizer.state_dict(),
+                        'scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
                         'args': args,
                         'steps': global_step,
                     }
@@ -476,9 +888,48 @@ def main(args):
 
                     accelerator.log(val_logs, step=global_step)
 
+                    flow_recon_grid = make_flow_reconstruction_grid(
+                        ema,
+                        vae,
+                        val_dataloader,
+                        accelerator,
+                        args,
+                    )
+
+                    counterfactual_grid = make_counterfactual_grid(
+                        ema,
+                        vae,
+                        val_dataloader,
+                        accelerator,
+                        args,
+                    )
+
                     if accelerator.is_main_process:
                         append_jsonl(validation_path, {'step': global_step, **val_logs})
+
+                        recon_path = os.path.join(
+                            recon_dir,
+                            f'flow_recon_step_{global_step:07d}.png',
+                        )
+                        Image.fromarray(flow_recon_grid).save(recon_path)
+
+                        counterfactual_path = os.path.join(
+                            counterfactual_dir,
+                            f'counterfactual_step_{global_step:07d}.png',
+                        )
+                        Image.fromarray(counterfactual_grid).save(counterfactual_path)
+
+                        accelerator.log(
+                            {
+                                'reconstructions/flow_inversion': wandb.Image(flow_recon_grid),
+                                'counterfactuals/flow_inversion': wandb.Image(counterfactual_grid),
+                            },
+                            step=global_step,
+                        )
+
                         run_logger.info(f'Validation step {global_step}: {val_logs}')
+                        run_logger.info(f'Saved flow inversion reconstructions to {recon_path}')
+                        run_logger.info(f'Saved counterfactuals to {counterfactual_path}')
 
                 if global_step == 1 or global_step % args.sampling_steps == 0:
                     out_samples = generate_ema_samples(
@@ -524,9 +975,13 @@ def parse_args(input_args=None):
     parser.add_argument('--validation-steps', type=int, default=5000)
     parser.add_argument('--validation-batches', type=int, default=16)
     parser.add_argument('--num-sample-images', type=int, default=16)
+    parser.add_argument('--num-recon-images', type=int, default=8)
+    parser.add_argument('--reconstruction-num-steps', type=int, default=50)
+    parser.add_argument('--num-counterfactual-images', type=int, default=4)
+    parser.add_argument('--counterfactual-num-steps', type=int, default=50)
     parser.add_argument('--sample-seed', type=int, default=1234)
     parser.add_argument('--sample-num-steps', type=int, default=50)
-    parser.add_argument('--sample-cfg-scale', type=float, default=4.0)
+    parser.add_argument('--sample-cfg-scale', type=float, default=1.0)
     parser.add_argument('--resume-step', type=int, default=0)
     parser.add_argument('--continue-train-exp-dir', type=str, default=None)
 
@@ -535,28 +990,29 @@ def parse_args(input_args=None):
     parser.add_argument('--qk-norm', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--fused-attn', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--bn-momentum', type=float, default=0.1)
-    parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument('--data-dir', type=str, required=True)
     parser.add_argument('--split-dir', type=str, required=True)
-    parser.add_argument('--height', type=int, default=512)
-    parser.add_argument('--width', type=int, default=384)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--height', type=int, default=256)
+    parser.add_argument('--width', type=int, default=192)
+    parser.add_argument('--batch-size', type=int, default=8)
 
     parser.add_argument('--allow-tf32', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--mixed-precision', type=str, default='fp16', choices=['no', 'fp16', 'bf16'])
+    parser.add_argument('--mixed-precision', type=str, default='bf16', choices=['no', 'fp16', 'bf16'])
     parser.add_argument('--epochs', type=int, default=1400)
     parser.add_argument('--max-train-steps', type=int, default=400000)
-    parser.add_argument('--checkpointing-steps', type=int, default=50000)
+    parser.add_argument('--checkpointing-steps', type=int, default=5000)
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--lr-warmup-steps', type=int, default=2000)
     parser.add_argument('--adam-beta1', type=float, default=0.9)
     parser.add_argument('--adam-beta2', type=float, default=0.999)
     parser.add_argument('--adam-weight-decay', type=float, default=0.)
     parser.add_argument('--adam-epsilon', type=float, default=1e-8)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--num-workers', type=int, default=8)
 
     parser.add_argument('--path-type', type=str, default='linear', choices=['linear', 'cosine'])
     parser.add_argument('--prediction', type=str, default='v', choices=['v'])
