@@ -8,9 +8,11 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+from torch import Tensor
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed
 
 from models.embedder import CondEmbedderConfig, PerAttrCondEmbedder
 
@@ -71,54 +73,96 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
-class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
-
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-        return embeddings
-
-
-
-
 #################################################################################
 #                                 Core SiT Model                                #
 #################################################################################
 
+class RMSNormFP32(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.normalized_shape = (dim,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, x: Tensor) -> Tensor:
+        dtype = x.dtype
+        x_fp32 = x.float()
+        x_fp32 = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+        if self.weight is not None:
+            x_fp32 = x_fp32 * self.weight.float()
+
+        return x_fp32.to(dtype)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, fused_attn=True):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qk_norm = qk_norm
+        self.fused_attn = fused_attn
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
+        self.q_norm = RMSNormFP32(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNormFP32(self.head_dim) if qk_norm else nn.Identity()
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(q, k, v)
+        else:
+            q = q * (self.head_dim ** -0.5)
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        return self.proj(x)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, in_features, hidden_features):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, 2 * hidden_features)
+        self.fc2 = nn.Linear(hidden_features, in_features)
+
+    def forward(self, x):
+        x, gate = self.fc1(x).chunk(2, dim=-1)
+        return self.fc2(x * F.silu(gate))
+
+
 class SiTBlock(nn.Module):
     """
-    A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning,
+    optional FP32 query-key RMSNorm, and a SwiGLU feed-forward network.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=8 / 3, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"])
-        if "fused_attn" in block_kwargs.keys():
-            self.attn.fused_attn = block_kwargs["fused_attn"]
+        self.attn = Attention(
+            hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            qk_norm=block_kwargs.get("qk_norm", True),
+            fused_attn=block_kwargs.get("fused_attn", True),
+        )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = SwiGLU(hidden_size, mlp_hidden_dim)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
     def forward(self, x, c):
@@ -160,7 +204,7 @@ class SiT(nn.Module):
         encoder_depth=8,
         depth=28,
         num_heads=16,
-        mlp_ratio=4.0,
+        mlp_ratio=8 / 3,
         class_dropout_prob=0.1,
         num_classes=1000,
         z_dims=[768],
