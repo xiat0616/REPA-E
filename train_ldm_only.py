@@ -2,31 +2,32 @@ import argparse
 import copy
 import json
 import logging
-import math
 import os
 from collections import OrderedDict
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import wandb
 from PIL import Image
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torch.utils.data import DataLoader
 from torchvision.transforms import Normalize
-from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 from data_handle.embed import DatasetConfig, get_embed
 from models.autoencoder import vae_models
 from models.sit import SiT_models
-from samplers import euler_sampler
-from utils import load_encoders, denormalize_latents, preprocess_imgs_vae
+from plot_utils import (
+    array2grid,
+    generate_ema_samples,
+    make_counterfactual_grid,
+    make_flow_reconstruction_grid,
+    prepare_ema_sampling_inputs,
+)
+from utils import load_encoders, preprocess_imgs_vae
 
 
 logger = get_logger(__name__)
@@ -51,133 +52,6 @@ def preprocess_raw_image(x, enc_type):
         x = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)(x / 255.)
         x = torch.nn.functional.interpolate(x, size=(14 * (h // 16), 14 * (w // 16)), mode='bicubic', align_corners=False)
     return x
-
-
-def array2grid(x, nrow=None):
-    if x.shape[1] != 1:
-        x = x.mean(dim=1, keepdim=True)
-    if nrow is None:
-        nrow = max(1, round(math.sqrt(x.size(0))))
-    x = make_grid(x.clamp(0, 1), nrow=nrow, value_range=(0, 1))
-    x = x[0]
-    return x.mul(255).add_(0.5).clamp_(0, 255).to('cpu', torch.uint8).numpy()
-
-
-def _show_image(ax, img):
-    img = img.detach().cpu()
-
-    if img.ndim != 3:
-        raise ValueError(f'Expected CHW image, got {tuple(img.shape)}.')
-
-    if img.shape[0] == 1:
-        ax.imshow(img[0], cmap='gray', vmin=0, vmax=1)
-    else:
-        ax.imshow(img.mean(dim=0), cmap='gray', vmin=0, vmax=1)
-
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-
-def _show_difference(ax, original, output):
-    diff = (output - original).detach().cpu()
-
-    if diff.ndim != 3:
-        raise ValueError(f'Expected CHW difference image, got {tuple(diff.shape)}.')
-
-    if diff.shape[0] == 1:
-        diff = diff[0]
-    else:
-        diff = diff.mean(dim=0)
-
-    # Match the previous plotting code:
-    # signed intensity difference on approximately [-255, 255].
-    diff = diff * 255.0
-
-    amax = float(diff.abs().max())
-    if amax == 0:
-        amax = 1.0
-
-    effect = ax.imshow(
-        diff,
-        cmap='RdBu_r',
-        vmin=-amax,
-        vmax=amax,
-    )
-
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-    divider = make_axes_locatable(ax)
-    cax = divider.append_axes('bottom', size='4%', pad=0.06)
-    cbar = ax.figure.colorbar(effect, cax=cax, orientation='horizontal')
-    cbar.outline.set_visible(False)
-    cbar.ax.tick_params(labelsize=7, pad=1)
-
-    ticks = np.linspace(np.ceil(-amax), np.floor(amax), 5)
-    cbar.set_ticks(np.round(ticks))
-
-
-def _comparison_figure_to_array(originals, outputs, output_labels):
-    originals = originals.detach().cpu()
-    outputs = [x.detach().cpu() for x in outputs]
-
-    if len(outputs) != len(output_labels):
-        raise ValueError('outputs and output_labels must have the same length.')
-
-    n = originals.shape[0]
-    nrows = 1 + 2 * len(outputs)
-
-    fig, axes = plt.subplots(
-        nrows,
-        n,
-        figsize=(2.8 * n, 2.8 * nrows),
-        squeeze=False,
-    )
-
-    for j in range(n):
-        _show_image(axes[0, j], originals[j])
-        if j == 0:
-            axes[0, j].set_ylabel('Original', fontsize=10, labelpad=10)
-
-    for i, (output, label) in enumerate(zip(outputs, output_labels)):
-        image_row = 1 + 2 * i
-        diff_row = image_row + 1
-
-        for j in range(n):
-            _show_image(axes[image_row, j], output[j])
-            _show_difference(
-                axes[diff_row, j],
-                originals[j],
-                output[j],
-            )
-
-            if j == 0:
-                axes[image_row, j].set_ylabel(label, fontsize=10, labelpad=10)
-                axes[diff_row, j].set_ylabel(
-                    f'{label}\n- Original',
-                    fontsize=10,
-                    labelpad=10,
-                )
-
-    fig.subplots_adjust(
-        left=0.08,
-        right=0.995,
-        top=0.995,
-        bottom=0.01,
-        wspace=0.05,
-        hspace=0.18,
-    )
-
-    fig.canvas.draw()
-    array = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
-    plt.close(fig)
-    return array
 
 
 def append_jsonl(path, row):
@@ -225,6 +99,103 @@ def original_model(accelerator, model, compiled=False):
     return model._orig_mod if compiled and hasattr(model, '_orig_mod') else model
 
 
+def _snapshot_value(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu()
+    if isinstance(x, dict):
+        return {k: _snapshot_value(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_snapshot_value(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(_snapshot_value(v) for v in x)
+    if isinstance(x, (str, int, float, bool, type(None))):
+        return x
+    return repr(x)
+
+
+def capture_rng_state(device):
+    state = {'cpu': torch.get_rng_state()}
+    if device.type == 'cuda':
+        state['cuda'] = torch.cuda.get_rng_state(device).cpu()
+    return state
+
+
+def collect_bad_gradients(model):
+    bad_grad_stats = []
+    bad_grad_tensors = {}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        grad = p.grad.detach()
+        finite_mask = torch.isfinite(grad)
+        if finite_mask.all():
+            continue
+        finite = grad[finite_mask]
+        bad_grad_stats.append({
+            'name': name,
+            'shape': tuple(grad.shape),
+            'dtype': str(grad.dtype),
+            'finite_absmax': finite.abs().max().item() if finite.numel() else float('nan'),
+            'num_nan': torch.isnan(grad).sum().item(),
+            'num_posinf': torch.isposinf(grad).sum().item(),
+            'num_neginf': torch.isneginf(grad).sum().item(),
+            'numel': grad.numel(),
+        })
+        bad_grad_tensors[name] = grad.cpu()
+    return bad_grad_stats, bad_grad_tensors
+
+
+def save_failure_snapshot(
+    accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
+    reason, z=None, parents=None, zs=None, raw_image=None, batch=None,
+    forward_rng_state=None, losses=None, bad_grad_stats=None, bad_grad_tensors=None,
+):
+    failing_step = global_step + 1
+    rank = accelerator.process_index
+    step_dir = os.path.join(failure_dir, f'step_{failing_step:07d}')
+    os.makedirs(step_dir, exist_ok=True)
+
+    rank_snapshot = {
+        'failing_step': failing_step,
+        'rank': rank,
+        'reason': reason,
+        'mixed_precision': args.mixed_precision,
+        'compile': args.compile,
+        'fused_attn': args.fused_attn,
+        'qk_norm': args.qk_norm,
+        'z': _snapshot_value(z),
+        'parents': _snapshot_value(parents),
+        'zs': _snapshot_value(zs),
+        'raw_image': _snapshot_value(raw_image),
+        'batch': _snapshot_value(batch),
+        'forward_rng_state': _snapshot_value(forward_rng_state),
+        'losses': losses or {},
+        'bad_grad_stats': bad_grad_stats or [],
+        'bad_grad_tensors': bad_grad_tensors or {},
+    }
+    rank_path = os.path.join(step_dir, f'rank_{rank}.pt')
+    torch.save(rank_snapshot, rank_path)
+    print(f'[rank{rank}] Saved failure inputs to {rank_path}', flush=True)
+
+    if accelerator.is_main_process:
+        base_model = original_model(accelerator, model, args.compile)
+        checkpoint = {
+            'model': base_model.state_dict(),
+            'ema': ema.state_dict(),
+            'opt': optimizer.state_dict(),
+            'scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            'args': args,
+            'steps': global_step,
+            'failing_step': failing_step,
+            'reason': reason,
+        }
+        checkpoint_path = os.path.join(step_dir, 'model_before_failure.pt')
+        torch.save(checkpoint, checkpoint_path)
+        print(f'[rank0] Saved pre-update model checkpoint to {checkpoint_path}', flush=True)
+
+    return step_dir
+
+
 def batch_to_parents(batch, device):
     pa = batch['pa']
     return {
@@ -233,28 +204,6 @@ def batch_to_parents(batch, device):
         'density': pa['density'].float().to(device),
         'scanner': pa['scanner'].float().to(device),
     }
-
-
-def slice_parents(parents, n):
-    return {k: v[:n] for k, v in parents.items()}
-
-
-def make_counterfactual_parents(parents, attr):
-    cf = {k: v.clone() for k, v in parents.items()}
-
-    if attr == 'view':
-        cf['view'] = torch.roll(cf['view'], shifts=1, dims=1)
-    elif attr == 'density':
-        cf['density'] = torch.roll(cf['density'], shifts=1, dims=1)
-    elif attr == 'scanner':
-        cf['scanner'] = torch.roll(cf['scanner'], shifts=1, dims=1)
-    elif attr == 'age':
-        age = cf['age']
-        cf['age'] = torch.where(age <= 0.9, age + 0.1, age - 0.1).clamp(0, 1)
-    else:
-        raise ValueError(f'Unknown counterfactual attribute: {attr}')
-
-    return cf
 
 
 @torch.no_grad()
@@ -328,194 +277,6 @@ def validate_sit(model, vae, val_dataloader, encoders, encoder_types, architectu
     }
 
 
-@torch.no_grad()
-def flow_euler(model, x, parents, t_start, t_end, num_steps):
-    timesteps = torch.linspace(t_start, t_end, num_steps + 1, device=x.device, dtype=x.dtype)
-
-    for i in range(num_steps):
-        t = torch.full((x.shape[0],), timesteps[i], device=x.device, dtype=x.dtype)
-        dt = timesteps[i + 1] - timesteps[i]
-        velocity = model.inference(x, t, parents)
-        x = x + dt * velocity
-
-    return x
-
-
-@torch.no_grad()
-def encode_flow_input(ema, vae, images):
-    raw_image = images.repeat(1, 3, 1, 1) * 255.0
-    processed_image = preprocess_imgs_vae(raw_image)
-
-    with torch.autocast(device_type=raw_image.device.type, enabled=False):
-        posterior, _, _ = vae(processed_image.float())
-        z = posterior.mode().float()
-
-    return ema.bn(z)
-
-
-@torch.no_grad()
-def decode_flow_latent(ema, vae, z):
-    latents_stats = ema.extract_latents_stats()
-    in_channels = z.shape[1]
-    latents_scale = latents_stats['latents_scale'].view(1, in_channels, 1, 1)
-    latents_bias = latents_stats['latents_bias'].view(1, in_channels, 1, 1)
-    z = denormalize_latents(z.float(), latents_scale, latents_bias)
-
-    with torch.autocast(device_type=z.device.type, enabled=False):
-        images = vae.decode(z.float()).sample
-
-    images = images.mean(dim=1, keepdim=True)
-    return ((images + 1.) / 2.).clamp(0, 1)
-
-
-@torch.no_grad()
-def make_flow_reconstruction_grid(ema, vae, val_dataloader, accelerator, args):
-    ema.eval()
-    vae.eval()
-
-    batch = next(iter(val_dataloader))
-    original = batch['x'].to(accelerator.device)
-    parents = batch_to_parents(batch, accelerator.device)
-
-    n = min(original.shape[0], args.num_recon_images)
-    original = original[:n]
-    parents = slice_parents(parents, n)
-
-    z0 = encode_flow_input(ema, vae, original)
-
-    zT = flow_euler(
-        ema,
-        z0,
-        parents,
-        t_start=0.0,
-        t_end=1.0,
-        num_steps=args.reconstruction_num_steps,
-    )
-
-    z_recon = flow_euler(
-        ema,
-        zT,
-        parents,
-        t_start=1.0,
-        t_end=0.0,
-        num_steps=args.reconstruction_num_steps,
-    )
-
-    recon = decode_flow_latent(ema, vae, z_recon)
-
-    originals = accelerator.gather(original.float())
-    recons = accelerator.gather(recon.float())
-
-    if not accelerator.is_main_process:
-        return None
-
-    n = min(args.num_recon_images, originals.shape[0], recons.shape[0])
-    originals = originals[:n]
-    recons = recons[:n]
-
-    return _comparison_figure_to_array(
-        originals=originals,
-        outputs=[recons],
-        output_labels=['Reconstruction'],
-    )
-
-
-@torch.no_grad()
-def make_counterfactual_grid(ema, vae, val_dataloader, accelerator, args):
-    ema.eval()
-    vae.eval()
-
-    batch = next(iter(val_dataloader))
-    original = batch['x'].to(accelerator.device)
-    parents = batch_to_parents(batch, accelerator.device)
-
-    n = min(original.shape[0], args.num_counterfactual_images)
-    original = original[:n]
-    parents = slice_parents(parents, n)
-
-    z0 = encode_flow_input(ema, vae, original)
-
-    # Abduction: invert once using factual parents.
-    zT = flow_euler(
-        ema,
-        z0,
-        parents,
-        t_start=0.0,
-        t_end=1.0,
-        num_steps=args.counterfactual_num_steps,
-    )
-
-    counterfactuals = []
-
-    for attr in ['view', 'density', 'scanner', 'age']:
-        cf_parents = make_counterfactual_parents(parents, attr)
-
-        z_cf = flow_euler(
-            ema,
-            zT,
-            cf_parents,
-            t_start=1.0,
-            t_end=0.0,
-            num_steps=args.counterfactual_num_steps,
-        )
-
-        counterfactuals.append(decode_flow_latent(ema, vae, z_cf))
-
-    originals = accelerator.gather(original.float())
-    counterfactuals = [accelerator.gather(x.float()) for x in counterfactuals]
-
-    if not accelerator.is_main_process:
-        return None
-
-    n = min(
-        args.num_counterfactual_images,
-        originals.shape[0],
-        *[x.shape[0] for x in counterfactuals],
-    )
-
-    originals = originals[:n]
-    counterfactuals = [x[:n] for x in counterfactuals]
-
-    return _comparison_figure_to_array(
-        originals=originals,
-        outputs=counterfactuals,
-        output_labels=[
-            'View CF',
-            'Density CF',
-            'Scanner CF',
-            'Age CF',
-        ],
-    )
-
-
-@torch.no_grad()
-def generate_ema_samples(ema, vae, xT, parents, in_channels, accelerator, args):
-    ema.eval()
-    vae.eval()
-
-    samples = euler_sampler(
-        ema,
-        xT,
-        parents,
-        num_steps=args.sample_num_steps,
-        cfg_scale=args.sample_cfg_scale,
-        guidance_low=0.,
-        guidance_high=1.,
-        path_type=args.path_type,
-        heun=False,
-    ).to(torch.float32)
-
-    latents_stats = ema.extract_latents_stats()
-    latents_scale = latents_stats['latents_scale'].view(1, in_channels, 1, 1)
-    latents_bias = latents_stats['latents_bias'].view(1, in_channels, 1, 1)
-
-    samples = vae.decode(denormalize_latents(samples, latents_scale, latents_bias)).sample
-    samples = samples.mean(dim=1, keepdim=True)
-    samples = (samples + 1) / 2.
-
-    return accelerator.gather(samples.to(torch.float32))
-
-
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -531,7 +292,9 @@ def main(args):
     sample_dir = os.path.join(save_dir, 'samples')
     recon_dir = os.path.join(save_dir, 'reconstructions')
     counterfactual_dir = os.path.join(save_dir, 'counterfactuals')
+    failure_dir = os.path.join(save_dir, 'failures')
     validation_path = os.path.join(save_dir, 'validation_metrics.jsonl')
+    os.makedirs(failure_dir, exist_ok=True)
 
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -749,19 +512,8 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    local_sample_count = max(1, math.ceil(args.num_sample_images / accelerator.num_processes))
-    sample_batch = next(iter(val_dataloader))
-    sample_parents = batch_to_parents(sample_batch, device)
-    local_sample_count = min(local_sample_count, sample_parents['age'].shape[0])
-    sample_parents = slice_parents(sample_parents, local_sample_count)
-
-    sample_gen = torch.Generator(device=device)
-    sample_gen.manual_seed(args.sample_seed + accelerator.process_index)
-
-    xT = torch.randn(
-        (local_sample_count, in_channels, latent_size[0], latent_size[1]),
-        generator=sample_gen,
-        device=device,
+    xT, sample_parents = prepare_ema_sampling_inputs(
+        val_dataloader, accelerator, args, in_channels, latent_size
     )
 
     for epoch in range(args.epochs):
@@ -777,12 +529,22 @@ def main(args):
             z = encode_vae_latent(vae, raw_image)
 
             if not torch.isfinite(z).all():
-                raise FloatingPointError(f'Non-finite VAE latent at step {global_step + 1}.')
+                reason = f'Non-finite VAE latent at step {global_step + 1}.'
+                save_failure_snapshot(
+                    accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
+                    reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
+                )
+                raise FloatingPointError(reason)
 
             with accelerator.accumulate(model), accelerator.autocast():
                 model.train()
                 base_model = original_model(accelerator, model, args.compile)
                 base_model.bn.eval()
+
+                # Save the exact RNG state immediately before SiT forward. The flow model samples
+                # t/noise internally, so restoring this state with the saved z/parents reproduces
+                # the same stochastic training example without modifying models/sit.py.
+                forward_rng_state = capture_rng_state(device)
 
                 sit_outputs = model(
                     x=z,
@@ -799,32 +561,56 @@ def main(args):
                 denoising_loss = sit_outputs['denoising_loss'].mean()
                 proj_loss = sit_outputs['proj_loss'].mean()
                 sit_loss = denoising_loss + args.proj_coeff * proj_loss if use_repa else denoising_loss
+                losses = {
+                    'sit_loss': sit_loss.detach().float().item(),
+                    'denoising_loss': denoising_loss.detach().float().item(),
+                    'proj_loss': proj_loss.detach().float().item(),
+                }
 
                 if not torch.isfinite(sit_loss):
-                    raise FloatingPointError(
+                    reason = (
                         f'Non-finite loss at step {global_step + 1}: '
                         f'denoise={denoising_loss.item()}, proj={proj_loss.item()}'
                     )
+                    save_failure_snapshot(
+                        accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
+                        reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
+                        forward_rng_state=forward_rng_state, losses=losses,
+                    )
+                    raise FloatingPointError(reason)
 
                 accelerator.backward(sit_loss)
 
                 base_model = original_model(accelerator, model, args.compile)
-                for name, p in base_model.named_parameters():
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        finite = p.grad[torch.isfinite(p.grad)]
-                        finite_max = finite.abs().max().item() if finite.numel() else float('nan')
-                        raise FloatingPointError(
-                            f'Non-finite gradient at step {global_step + 1}: '
-                            f'{name}, shape={tuple(p.shape)}, finite_absmax={finite_max}'
-                        )
+                bad_grad_stats, bad_grad_tensors = collect_bad_gradients(base_model)
+                if bad_grad_stats:
+                    first = bad_grad_stats[0]
+                    reason = (
+                        f'Non-finite gradients at step {global_step + 1}: {len(bad_grad_stats)} parameter(s); '
+                        f'first={first["name"]}, shape={first["shape"]}, finite_absmax={first["finite_absmax"]}, '
+                        f'nan={first["num_nan"]}, +inf={first["num_posinf"]}, -inf={first["num_neginf"]}'
+                    )
+                    for item in bad_grad_stats:
+                        print(f'[rank{accelerator.process_index}] bad_grad: {item}', flush=True)
+                    save_failure_snapshot(
+                        accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
+                        reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
+                        forward_rng_state=forward_rng_state, losses=losses,
+                        bad_grad_stats=bad_grad_stats, bad_grad_tensors=bad_grad_tensors,
+                    )
+                    raise FloatingPointError(reason)
 
                 if accelerator.sync_gradients:
                     grad_norm_sit = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                     if not torch.isfinite(torch.as_tensor(grad_norm_sit, device=device)):
-                        raise FloatingPointError(
-                            f'Non-finite gradient norm at step {global_step + 1}: {grad_norm_sit}'
+                        reason = f'Non-finite gradient norm at step {global_step + 1}: {grad_norm_sit}'
+                        save_failure_snapshot(
+                            accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
+                            reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
+                            forward_rng_state=forward_rng_state, losses=losses,
                         )
+                        raise FloatingPointError(reason)
 
                 optimizer.step()
 
