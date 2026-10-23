@@ -7,13 +7,12 @@
 # --------------------------------------------------------
 
 import math
-
 import numpy as np
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
-from models.embedder import CondEmbedderConfig, PerAttrCondEmbedder
+from embedder import CondEmbedderConfig, PerAttrCondEmbedder
 
 
 def mean_flat(x):
@@ -35,7 +34,7 @@ def modulate(x, shift, scale):
 
 
 #################################################################################
-#                              Timestep Embedding                               #
+#                              Timestep Embedder                                #
 #################################################################################
 
 class TimestepEmbedder(nn.Module):
@@ -52,166 +51,65 @@ class TimestepEmbedder(nn.Module):
     def positional_embedding(t, dim, max_period=10000):
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
-            / half
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         ).to(device=t.device)
-
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
         if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])],
-                dim=-1,
-            )
-
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
-        t_freq = self.positional_embedding(
-            t,
-            dim=self.frequency_embedding_size,
-        ).to(t.dtype)
-
+        t_freq = self.positional_embedding(t, dim=self.frequency_embedding_size).to(t.dtype)
         return self.mlp(t_freq)
 
 
 #################################################################################
-#                                 SiT Block                                     #
+#                                  SiT Block                                    #
 #################################################################################
 
 class SiTBlock(nn.Module):
-    """
-    Original REPA-E / SiT transformer block with adaLN-Zero conditioning.
-    """
-    def __init__(
-        self,
-        hidden_size,
-        num_heads,
-        mlp_ratio=4.0,
-        **block_kwargs,
-    ):
+    """ REPA-E/SiT transformer block with adaLN-Zero conditioning."""
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-
-        self.norm1 = nn.LayerNorm(
-            hidden_size,
-            elementwise_affine=False,
-            eps=1e-6,
-        )
-
-        self.attn = Attention(
-            hidden_size,
-            num_heads=num_heads,
-            qkv_bias=True,
-            qk_norm=block_kwargs["qk_norm"],
-        )
-
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"])
         if "fused_attn" in block_kwargs:
             self.attn.fused_attn = block_kwargs["fused_attn"]
 
-        self.norm2 = nn.LayerNorm(
-            hidden_size,
-            elementwise_affine=False,
-            eps=1e-6,
-        )
-
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-
-        self.mlp = Mlp(
-            in_features=hidden_size,
-            hidden_features=mlp_hidden_dim,
-            act_layer=approx_gelu,
-            drop=0,
-        )
-
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(
-                hidden_size,
-                6 * hidden_size,
-                bias=True,
-            ),
-        )
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0,)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True),)
 
     def forward(self, x, c):
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaLN_modulation(c).chunk(6, dim=-1)
-
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(
-                self.norm1(x),
-                shift_msa,
-                scale_msa,
-            )
-        )
-
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(
-                self.norm2(x),
-                shift_mlp,
-                scale_mlp,
-            )
-        )
-
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
 #################################################################################
-#                                Final Layer                                    #
+#                                 Final Layer                                   #
 #################################################################################
 
 class FinalLayer(nn.Module):
-    def __init__(
-        self,
-        hidden_size,
-        patch_size,
-        out_channels,
-    ):
+    def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-
-        self.norm_final = nn.LayerNorm(
-            hidden_size,
-            elementwise_affine=False,
-            eps=1e-6,
-        )
-
-        self.linear = nn.Linear(
-            hidden_size,
-            patch_size * patch_size * out_channels,
-            bias=True,
-        )
-
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(
-                hidden_size,
-                2 * hidden_size,
-                bias=True,
-            ),
-        )
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True),)
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-
-        x = modulate(
-            self.norm_final(x),
-            shift,
-            scale,
-        )
-
+        x = modulate(self.norm_final(x), shift, scale)
         return self.linear(x)
 
 
 #################################################################################
-#                                    SiT                                        #
+#                                     SiT                                       #
 #################################################################################
 
 class SiT(nn.Module):
@@ -235,7 +133,6 @@ class SiT(nn.Module):
         **block_kwargs,
     ):
         super().__init__()
-
         self.path_type = path_type
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -246,65 +143,32 @@ class SiT(nn.Module):
         self.encoder_depth = encoder_depth
         self.class_dropout_prob = class_dropout_prob
 
-        self.x_embedder = PatchEmbed(
-            input_size,
-            patch_size,
-            in_channels,
-            hidden_size,
-            bias=True,
-        )
-
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
 
-        # Mammography parent conditioning.
         cond_cfg = CondEmbedderConfig(
             parents=["age", "view", "density", "scanner"],
-            parent_dims={
-                "age": 1,
-                "view": 2,
-                "density": 4,
-                "scanner": 5,
-            },
+            parent_dims={"age": 1, "view": 2, "density": 4, "scanner": 5},
             cond_embed_dim=hidden_size,
         )
-
         self.parent_embedder = PerAttrCondEmbedder(cond_cfg)
 
-        num_patches = self.x_embedder.num_patches
-
         self.pos_embed = nn.Parameter(
-            torch.zeros(
-                1,
-                num_patches,
-                hidden_size,
-            ),
+            torch.zeros(1, self.x_embedder.num_patches, hidden_size),
             requires_grad=False,
         )
 
         self.blocks = nn.ModuleList([
-            SiTBlock(
-                hidden_size,
-                num_heads,
-                mlp_ratio=mlp_ratio,
-                **block_kwargs,
-            )
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs)
             for _ in range(depth)
         ])
 
         self.projectors = nn.ModuleList([
-            build_mlp(
-                hidden_size,
-                projector_dim,
-                z_dim,
-            )
+            build_mlp(hidden_size, projector_dim, z_dim)
             for z_dim in z_dims
         ])
 
-        self.final_layer = FinalLayer(
-            decoder_hidden_size,
-            patch_size,
-            self.out_channels,
-        )
+        self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels)
 
         self.bn = nn.BatchNorm2d(
             in_channels,
@@ -313,7 +177,6 @@ class SiT(nn.Module):
             affine=False,
             track_running_stats=True,
         )
-
         self.bn.reset_running_stats()
 
         self.initialize_weights()
@@ -322,219 +185,80 @@ class SiT(nn.Module):
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
-
                 if module.bias is not None:
-                    nn.init.constant_(
-                        module.bias,
-                        0,
-                    )
+                    nn.init.constant_(module.bias, 0)
 
         self.apply(_basic_init)
 
-        # Rectangular positional embedding support.
         pos_embed = get_2d_sincos_pos_embed(
             self.pos_embed.shape[-1],
             self.x_embedder.grid_size,
         )
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        self.pos_embed.data.copy_(
-            torch.from_numpy(pos_embed)
-            .float()
-            .unsqueeze(0)
-        )
-
-        # Patch embedding initialization.
         w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        nn.init.xavier_uniform_(
-            w.view([w.shape[0], -1])
-        )
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        nn.init.constant_(
-            self.x_embedder.proj.bias,
-            0,
-        )
-
-        # Timestep embedding.
-        nn.init.normal_(
-            self.t_embedder.mlp[0].weight,
-            std=0.02,
-        )
-
-        nn.init.normal_(
-            self.t_embedder.mlp[2].weight,
-            std=0.02,
-        )
-
-        # Original adaLN-Zero initialization.
         for block in self.blocks:
-            nn.init.constant_(
-                block.adaLN_modulation[-1].weight,
-                0,
-            )
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-            nn.init.constant_(
-                block.adaLN_modulation[-1].bias,
-                0,
-            )
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
 
-        nn.init.constant_(
-            self.final_layer.adaLN_modulation[-1].weight,
-            0,
-        )
-
-        nn.init.constant_(
-            self.final_layer.adaLN_modulation[-1].bias,
-            0,
-        )
-
-        nn.init.constant_(
-            self.final_layer.linear.weight,
-            0,
-        )
-
-        nn.init.constant_(
-            self.final_layer.linear.bias,
-            0,
-        )
-
-    def embed_parents(
-        self,
-        parents,
-        force_drop_ids=None,
-    ):
+    def embed_parents(self, parents, force_drop_ids=None):
         parent_embed = self.parent_embedder(parents)
 
         if force_drop_ids is None:
-            if (
-                not self.training
-                or self.class_dropout_prob <= 0
-            ):
+            if not self.training or self.class_dropout_prob <= 0:
                 return parent_embed
-
-            drop_ids = (
-                torch.rand(
-                    parent_embed.shape[0],
-                    device=parent_embed.device,
-                )
-                < self.class_dropout_prob
-            )
-
+            drop_ids = torch.rand(parent_embed.shape[0], device=parent_embed.device) < self.class_dropout_prob
         else:
-            drop_ids = force_drop_ids.to(
-                device=parent_embed.device,
-                dtype=torch.bool,
-            )
+            drop_ids = force_drop_ids.to(device=parent_embed.device, dtype=torch.bool)
 
-        return torch.where(
-            drop_ids[:, None],
-            torch.zeros_like(parent_embed),
-            parent_embed,
-        )
+        return torch.where(drop_ids[:, None], torch.zeros_like(parent_embed), parent_embed)
 
-    def init_bn(
-        self,
-        latents_scale,
-        latents_bias,
-    ):
+    def init_bn(self, latents_scale, latents_bias):
         self.bn.running_mean = latents_bias
-
-        self.bn.running_var = (
-            1.0 / latents_scale
-        ).pow(2)
+        self.bn.running_var = (1.0 / latents_scale).pow(2)
 
     def extract_latents_stats(self):
         return {
-            "latents_scale":
-                self.bn.running_var.rsqrt(),
-
-            "latents_bias":
-                self.bn.running_mean,
+            "latents_scale": self.bn.running_var.rsqrt(),
+            "latents_bias": self.bn.running_mean,
         }
 
-    def unpatchify(
-        self,
-        x,
-        patch_size=None,
-    ):
+    def unpatchify(self, x, patch_size=None):
         c = self.out_channels
-
-        p = (
-            self.x_embedder.patch_size[0]
-            if patch_size is None
-            else patch_size
-        )
-
+        p = self.x_embedder.patch_size[0] if patch_size is None else patch_size
         h, w = self.x_embedder.grid_size
-
         assert h * w == x.shape[1]
 
-        x = x.reshape(
-            x.shape[0],
-            h,
-            w,
-            p,
-            p,
-            c,
-        )
+        x = x.reshape(x.shape[0], h, w, p, p, c)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(x.shape[0], c, h * p, w * p)
 
-        x = torch.einsum(
-            "nhwpqc->nchpwq",
-            x,
-        )
-
-        return x.reshape(
-            x.shape[0],
-            c,
-            h * p,
-            w * p,
-        )
-
-    def interpolant(
-        self,
-        t,
-        path_type=None,
-    ):
+    def interpolant(self, t, path_type=None):
         if path_type == "linear":
             alpha_t = 1 - t
             sigma_t = t
             d_alpha_t = -1
             d_sigma_t = 1
-
         elif path_type == "cosine":
-            alpha_t = torch.cos(
-                t * np.pi / 2
-            )
-
-            sigma_t = torch.sin(
-                t * np.pi / 2
-            )
-
-            d_alpha_t = (
-                -np.pi
-                / 2
-                * torch.sin(
-                    t * np.pi / 2
-                )
-            )
-
-            d_sigma_t = (
-                np.pi
-                / 2
-                * torch.cos(
-                    t * np.pi / 2
-                )
-            )
-
+            alpha_t = torch.cos(t * np.pi / 2)
+            sigma_t = torch.sin(t * np.pi / 2)
+            d_alpha_t = -np.pi / 2 * torch.sin(t * np.pi / 2)
+            d_sigma_t = np.pi / 2 * torch.cos(t * np.pi / 2)
         else:
             raise NotImplementedError()
 
-        return (
-            alpha_t,
-            sigma_t,
-            d_alpha_t,
-            d_sigma_t,
-        )
+        return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
     def forward(
         self,
@@ -546,312 +270,124 @@ class SiT(nn.Module):
         noises=None,
     ):
         normalized_x = self.bn(x)
+        use_repa = zs is not None and len(self.projectors) > 0
 
-        use_repa = (
-            zs is not None
-            and len(self.projectors) > 0
-        )
+        if loss_kwargs["align_only"] and not use_repa:
+            raise ValueError("align_only=True requires REPA features.")
 
-        if (
-            loss_kwargs["align_only"]
-            and not use_repa
-        ):
-            raise ValueError(
-                "align_only=True requires REPA features."
-            )
-
-        # Sample timestep.
         if time_input is None:
-            if (
-                loss_kwargs["weighting"]
-                == "uniform"
-            ):
-                time_input = torch.rand(
-                    (
-                        normalized_x.shape[0],
-                        1,
-                        1,
-                        1,
-                    )
-                )
-
-            elif (
-                loss_kwargs["weighting"]
-                == "lognormal"
-            ):
-                rnd_normal = torch.randn(
-                    (
-                        normalized_x.shape[0],
-                        1,
-                        1,
-                        1,
-                    )
-                )
-
+            if loss_kwargs["weighting"] == "uniform":
+                time_input = torch.rand((normalized_x.shape[0], 1, 1, 1))
+            elif loss_kwargs["weighting"] == "lognormal":
+                rnd_normal = torch.randn((normalized_x.shape[0], 1, 1, 1))
                 sigma = rnd_normal.exp()
 
-                if (
-                    loss_kwargs["path_type"]
-                    == "linear"
-                ):
-                    time_input = (
-                        sigma
-                        / (1 + sigma)
-                    )
-
-                elif (
-                    loss_kwargs["path_type"]
-                    == "cosine"
-                ):
-                    time_input = (
-                        2
-                        / np.pi
-                        * torch.atan(sigma)
-                    )
-
+                if loss_kwargs["path_type"] == "linear":
+                    time_input = sigma / (1 + sigma)
+                elif loss_kwargs["path_type"] == "cosine":
+                    time_input = 2 / np.pi * torch.atan(sigma)
+                else:
+                    raise NotImplementedError()
             else:
                 raise NotImplementedError(
-                    f"Weighting scheme "
-                    f"{loss_kwargs['weighting']} "
-                    f"not implemented."
+                    f"Weighting scheme {loss_kwargs['weighting']} not implemented."
                 )
 
-        time_input = time_input.to(
-            device=normalized_x.device,
-            dtype=normalized_x.dtype,
-        )
+        time_input = time_input.to(device=normalized_x.device, dtype=normalized_x.dtype)
 
-        # Sample noise.
         if noises is None:
-            noises = torch.randn_like(
-                normalized_x
-            )
-
+            noises = torch.randn_like(normalized_x)
         else:
-            noises = noises.to(
-                device=normalized_x.device,
-                dtype=normalized_x.dtype,
-            )
+            noises = noises.to(device=normalized_x.device, dtype=normalized_x.dtype)
 
-        (
-            alpha_t,
-            sigma_t,
-            d_alpha_t,
-            d_sigma_t,
-        ) = self.interpolant(
+        alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(
             time_input,
             path_type=loss_kwargs["path_type"],
         )
 
-        model_input = (
-            alpha_t * normalized_x
-            + sigma_t * noises
-        )
+        model_input = alpha_t * normalized_x + sigma_t * noises
 
-        if (
-            loss_kwargs["prediction"]
-            == "v"
-        ):
-            model_target = (
-                d_alpha_t * normalized_x
-                + d_sigma_t * noises
-            )
-
+        if loss_kwargs["prediction"] == "v":
+            model_target = d_alpha_t * normalized_x + d_sigma_t * noises
         else:
             raise NotImplementedError()
 
-        x = (
-            self.x_embedder(model_input)
-            + self.pos_embed
-        )
-
+        x = self.x_embedder(model_input) + self.pos_embed
         N, T, D = x.shape
 
-        t_embed = self.t_embedder(
-            time_input.flatten()
-        )
-
-        parent_embed = self.embed_parents(
-            parents
-        )
-
+        t_embed = self.t_embedder(time_input.flatten())
+        parent_embed = self.embed_parents(parents)
         c = t_embed + parent_embed
 
         zs_tilde = []
 
-        for i, block in enumerate(
-            self.blocks
-        ):
-            x = block(
-                x,
-                c,
-            )
+        for i, block in enumerate(self.blocks):
+            x = block(x, c)
 
-            if (
-                use_repa
-                and (i + 1)
-                == self.encoder_depth
-            ):
+            if use_repa and (i + 1) == self.encoder_depth:
                 zs_tilde = [
-                    projector(
-                        x.reshape(-1, D)
-                    ).reshape(
-                        N,
-                        T,
-                        -1,
-                    )
-                    for projector
-                    in self.projectors
+                    projector(x.reshape(-1, D)).reshape(N, T, -1)
+                    for projector in self.projectors
                 ]
 
-                if loss_kwargs[
-                    "align_only"
-                ]:
+                if loss_kwargs["align_only"]:
                     break
 
-        x = self.final_layer(
-            x,
-            c,
-        )
+        if loss_kwargs["align_only"]:
+            model_output = None
+            denoising_loss = None
+        else:
+            model_output = self.final_layer(x, c)
+            model_output = self.unpatchify(model_output)
+            denoising_loss = mean_flat((model_output - model_target) ** 2)
 
-        x = self.unpatchify(x)
-
-        denoising_loss = (
-            None
-            if loss_kwargs["align_only"]
-            else mean_flat(
-                (x - model_target) ** 2
-            )
-        )
-
-        proj_loss = torch.tensor(
-            0.0,
-            device=x.device,
-        )
+        proj_loss = torch.tensor(0.0, device=x.device)
 
         if use_repa:
             bsz = zs[0].shape[0]
 
-            for z, z_tilde in zip(
-                zs,
-                zs_tilde,
-            ):
-                for (
-                    z_j,
-                    z_tilde_j,
-                ) in zip(
-                    z,
-                    z_tilde,
-                ):
-                    z_tilde_j = (
-                        torch.nn.functional
-                        .normalize(
-                            z_tilde_j.float(),
-                            dim=-1,
-                        )
-                    )
+            for z, z_tilde in zip(zs, zs_tilde):
+                for z_j, z_tilde_j in zip(z, z_tilde):
+                    z_tilde_j = torch.nn.functional.normalize(z_tilde_j.float(), dim=-1)
+                    z_j = torch.nn.functional.normalize(z_j.float(), dim=-1)
+                    proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
 
-                    z_j = (
-                        torch.nn.functional
-                        .normalize(
-                            z_j.float(),
-                            dim=-1,
-                        )
-                    )
-
-                    proj_loss += mean_flat(
-                        -(
-                            z_j
-                            * z_tilde_j
-                        ).sum(dim=-1)
-                    )
-
-            proj_loss /= (
-                len(zs) * bsz
-            )
+            proj_loss /= len(zs) * bsz
 
         return {
-            "zs_tilde":
-                zs_tilde,
-
-            "model_output":
-                x,
-
-            "denoising_loss":
-                denoising_loss,
-
-            "proj_loss":
-                proj_loss,
-
-            "time_input":
-                time_input,
-
-            "noises":
-                noises,
+            "zs_tilde": zs_tilde,
+            "model_output": model_output,
+            "denoising_loss": denoising_loss,
+            "proj_loss": proj_loss,
+            "time_input": time_input,
+            "noises": noises,
         }
 
     @torch.no_grad()
-    def inference(
-        self,
-        x,
-        t,
-        parents,
-        force_drop_ids=None,
-    ):
-        x = (
-            self.x_embedder(x)
-            + self.pos_embed
-        )
+    def inference(self, x, t, parents, force_drop_ids=None):
+        x = self.x_embedder(x) + self.pos_embed
 
         t_embed = self.t_embedder(t)
-
-        parent_embed = self.embed_parents(
-            parents,
-            force_drop_ids=force_drop_ids,
-        )
-
+        parent_embed = self.embed_parents(parents, force_drop_ids=force_drop_ids)
         c = t_embed + parent_embed
 
         for block in self.blocks:
             x = block(x, c)
 
-        x = self.final_layer(
-            x,
-            c,
-        )
-
+        x = self.final_layer(x, c)
         return self.unpatchify(x)
 
     @torch.no_grad()
-    def forward_feats(
-        self,
-        x,
-        t,
-        parents,
-        depth,
-    ):
-        assert 1 <= depth <= len(
-            self.blocks
-        )
+    def forward_feats(self, x, t, parents, depth):
+        assert 1 <= depth <= len(self.blocks)
 
-        x = (
-            self.x_embedder(x)
-            + self.pos_embed
-        )
-
+        x = self.x_embedder(x) + self.pos_embed
         t_embed = self.t_embedder(t)
-
-        parent_embed = self.embed_parents(
-            parents
-        )
-
+        parent_embed = self.embed_parents(parents)
         c = t_embed + parent_embed
 
-        for i, block in enumerate(
-            self.blocks
-        ):
+        for i, block in enumerate(self.blocks):
             x = block(x, c)
-
             if (i + 1) == depth:
                 return x
 
@@ -859,144 +395,47 @@ class SiT(nn.Module):
 
 
 #################################################################################
-#                       Positional Embedding                                    #
+#                         Positional Embeddings                                 #
 #################################################################################
 
-def get_2d_sincos_pos_embed(
-    embed_dim,
-    grid_size,
-    cls_token=False,
-    extra_tokens=0,
-):
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     if isinstance(grid_size, int):
-        grid_h_size = grid_size
-        grid_w_size = grid_size
+        grid_h_size = grid_w_size = grid_size
     else:
-        (
-            grid_h_size,
-            grid_w_size,
-        ) = grid_size
+        grid_h_size, grid_w_size = grid_size
 
-    grid_h = np.arange(
-        grid_h_size,
-        dtype=np.float32,
-    )
+    grid_h = np.arange(grid_h_size, dtype=np.float32)
+    grid_w = np.arange(grid_w_size, dtype=np.float32)
+    grid = np.stack(np.meshgrid(grid_w, grid_h), axis=0)
+    grid = grid.reshape([2, 1, grid_h_size, grid_w_size])
 
-    grid_w = np.arange(
-        grid_w_size,
-        dtype=np.float32,
-    )
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
 
-    grid = np.meshgrid(
-        grid_w,
-        grid_h,
-    )
-
-    grid = np.stack(
-        grid,
-        axis=0,
-    )
-
-    grid = grid.reshape(
-        [
-            2,
-            1,
-            grid_h_size,
-            grid_w_size,
-        ]
-    )
-
-    pos_embed = (
-        get_2d_sincos_pos_embed_from_grid(
-            embed_dim,
-            grid,
-        )
-    )
-
-    if (
-        cls_token
-        and extra_tokens > 0
-    ):
+    if cls_token and extra_tokens > 0:
         pos_embed = np.concatenate(
-            [
-                np.zeros(
-                    [
-                        extra_tokens,
-                        embed_dim,
-                    ]
-                ),
-                pos_embed,
-            ],
+            [np.zeros([extra_tokens, embed_dim]), pos_embed],
             axis=0,
         )
 
     return pos_embed
 
 
-def get_2d_sincos_pos_embed_from_grid(
-    embed_dim,
-    grid,
-):
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
-
-    emb_h = (
-        get_1d_sincos_pos_embed_from_grid(
-            embed_dim // 2,
-            grid[0],
-        )
-    )
-
-    emb_w = (
-        get_1d_sincos_pos_embed_from_grid(
-            embed_dim // 2,
-            grid[1],
-        )
-    )
-
-    return np.concatenate(
-        [
-            emb_h,
-            emb_w,
-        ],
-        axis=1,
-    )
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return np.concatenate([emb_h, emb_w], axis=1)
 
 
-def get_1d_sincos_pos_embed_from_grid(
-    embed_dim,
-    pos,
-):
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
-
-    omega = np.arange(
-        embed_dim // 2,
-        dtype=np.float64,
-    )
-
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.0
-
-    omega = 1.0 / (
-        10000 ** omega
-    )
+    omega = 1.0 / 10000**omega
 
     pos = pos.reshape(-1)
-
-    out = np.einsum(
-        "m,d->md",
-        pos,
-        omega,
-    )
-
-    emb_sin = np.sin(out)
-    emb_cos = np.cos(out)
-
-    return np.concatenate(
-        [
-            emb_sin,
-            emb_cos,
-        ],
-        axis=1,
-    )
+    out = np.einsum("m,d->md", pos, omega)
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
 
 
 #################################################################################
@@ -1004,179 +443,67 @@ def get_1d_sincos_pos_embed_from_grid(
 #################################################################################
 
 def SiT_XL_1(**kwargs):
-    return SiT(
-        depth=28,
-        hidden_size=1152,
-        decoder_hidden_size=1152,
-        patch_size=1,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
 
 def SiT_XL_2(**kwargs):
-    return SiT(
-        depth=28,
-        hidden_size=1152,
-        decoder_hidden_size=1152,
-        patch_size=2,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 
 def SiT_XL_4(**kwargs):
-    return SiT(
-        depth=28,
-        hidden_size=1152,
-        decoder_hidden_size=1152,
-        patch_size=4,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 
 def SiT_XL_8(**kwargs):
-    return SiT(
-        depth=28,
-        hidden_size=1152,
-        decoder_hidden_size=1152,
-        patch_size=8,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
 
 def SiT_L_1(**kwargs):
-    return SiT(
-        depth=24,
-        hidden_size=1024,
-        decoder_hidden_size=1024,
-        patch_size=1,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
 
 
 def SiT_L_2(**kwargs):
-    return SiT(
-        depth=24,
-        hidden_size=1024,
-        decoder_hidden_size=1024,
-        patch_size=2,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
 
 def SiT_L_4(**kwargs):
-    return SiT(
-        depth=24,
-        hidden_size=1024,
-        decoder_hidden_size=1024,
-        patch_size=4,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
 
 def SiT_L_8(**kwargs):
-    return SiT(
-        depth=24,
-        hidden_size=1024,
-        decoder_hidden_size=1024,
-        patch_size=8,
-        num_heads=16,
-        **kwargs,
-    )
+    return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 
 def SiT_B_1(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=768,
-        decoder_hidden_size=768,
-        patch_size=1,
-        num_heads=12,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
 
 
 def SiT_B_2(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=768,
-        decoder_hidden_size=768,
-        patch_size=2,
-        num_heads=12,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 
 def SiT_B_4(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=768,
-        decoder_hidden_size=768,
-        patch_size=4,
-        num_heads=12,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 
 def SiT_B_8(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=768,
-        decoder_hidden_size=768,
-        patch_size=8,
-        num_heads=12,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
 
 def SiT_S_1(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=384,
-        decoder_hidden_size=384,
-        patch_size=1,
-        num_heads=6,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=384, decoder_hidden_size=384, patch_size=1, num_heads=6, **kwargs)
 
 
 def SiT_S_2(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=384,
-        decoder_hidden_size=384,
-        patch_size=2,
-        num_heads=6,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=384, decoder_hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
 
 def SiT_S_4(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=384,
-        decoder_hidden_size=384,
-        patch_size=4,
-        num_heads=6,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=384, decoder_hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 
 def SiT_S_8(**kwargs):
-    return SiT(
-        depth=12,
-        hidden_size=384,
-        decoder_hidden_size=384,
-        patch_size=8,
-        num_heads=6,
-        **kwargs,
-    )
+    return SiT(depth=12, hidden_size=384, decoder_hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
 SiT_models = {

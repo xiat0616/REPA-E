@@ -100,3 +100,118 @@ class GlobalCondEmbedder(nn.Module):
         concat_y = torch.cat(vals, dim=1)
         out = self.embed(concat_y)
         return F.normalize(out, p=2, dim=1)
+
+
+class LabelEmbedderMammo(nn.Module):
+    """
+    Embeds (density, scanner, view, age) conditioning into a single vector.
+    Handles classifier-free guidance via a single drop mask per sample.
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        num_density_classes: int,
+        num_scanner_classes: int,
+        num_view_classes: int = 2,
+        dropout_prob: float = 0.1,
+    ):
+        super().__init__()
+        self.dropout_prob = dropout_prob
+        self.use_cfg = dropout_prob > 0
+
+        # Categorical: +1 row for the CFG null token
+        self.density_emb = nn.Embedding(num_density_classes + self.use_cfg, hidden_size)
+        self.scanner_emb = nn.Embedding(num_scanner_classes + self.use_cfg, hidden_size)
+        self.view_emb = nn.Embedding(num_view_classes + self.use_cfg, hidden_size)
+
+        # Continuous age: scalar -> hidden_size
+        self.age_mlp = nn.Sequential(
+            nn.Linear(1, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+        # Learned null vector for age
+        if self.use_cfg:
+            self.age_null = nn.Parameter(torch.zeros(hidden_size))
+
+        # Null-token indices
+        self.null_density = num_density_classes
+        self.null_scanner = num_scanner_classes
+        self.null_view = num_view_classes
+
+        # Init (matches DiT convention)
+        nn.init.normal_(self.density_emb.weight, std=0.02)
+        nn.init.normal_(self.scanner_emb.weight, std=0.02)
+        nn.init.normal_(self.view_emb.weight, std=0.02)
+
+        for m in self.age_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, labels: dict, train: bool, force_drop_ids: torch.Tensor = None):
+        """
+        labels: dict with keys:
+            'label_density', 'label_scanner', 'label_view', 'label_age'
+
+            - density: long tensor [B]
+            - scanner: long tensor [B]
+            - view: long tensor [B]
+            - age: float tensor [B], assumed normalized to [-1, 1]
+
+        train: whether CFG dropout is active
+        force_drop_ids: optional [B] bool/int mask to force-drop samples
+                        (used for CFG at inference)
+
+        Returns:
+            [B, hidden_size] conditioning vector
+        """
+        density = labels['label_density']
+        scanner = labels['label_scanner']
+        view = labels['label_view']
+        age = labels['label_age'].float()
+
+        B = density.shape[0]
+        device = density.device
+
+        # One joint CFG drop mask per sample
+        if force_drop_ids is not None:
+            drop_mask = force_drop_ids.bool()
+        elif train and self.use_cfg:
+            drop_mask = torch.rand(B, device=device) < self.dropout_prob
+        else:
+            drop_mask = torch.zeros(B, dtype=torch.bool, device=device)
+
+        # Replace all categorical conditions with their null tokens together
+        if self.use_cfg:
+            density = torch.where(
+                drop_mask,
+                torch.full_like(density, self.null_density),
+                density,
+            )
+            scanner = torch.where(
+                drop_mask,
+                torch.full_like(scanner, self.null_scanner),
+                scanner,
+            )
+            view = torch.where(
+                drop_mask,
+                torch.full_like(view, self.null_view),
+                view,
+            )
+
+        density_e = self.density_emb(density)
+        scanner_e = self.scanner_emb(scanner)
+        view_e = self.view_emb(view)
+
+        # Continuous age
+        age_e = self.age_mlp(age.unsqueeze(-1))
+        if self.use_cfg:
+            age_e = torch.where(
+                drop_mask.unsqueeze(-1),
+                self.age_null.expand_as(age_e),
+                age_e,
+            )
+
+        return density_e + scanner_e + view_e + age_e
