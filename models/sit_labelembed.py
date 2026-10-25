@@ -5,14 +5,15 @@
 # GLIDE: https://github.com/openai/glide-text2im
 # MAE: https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 # --------------------------------------------------------
-
+import sys  
+sys.path.append("..")  # Adds higher directory to python modules path.
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
-from embedder import LabelEmbedderMammo
+from models.embedder import LabelEmbedderMammo
 
 
 def mean_flat(x):
