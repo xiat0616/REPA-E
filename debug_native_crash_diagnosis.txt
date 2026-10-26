@@ -1,0 +1,41 @@
+Native startup crash diagnosis — 25 October 2026
+
+Failed training job:82783, experiment debug_4, node lora.
+Both workers terminated with SIGSEGV / exitcode -11 before args.json or application logs.
+
+Reproducer1: job82784, two GPUs on lora, no model construction or compilation.
+All imports succeeded. Both ranks segfaulted during Accelerator initialization:
+Accelerator -> backend selection -> torch.cuda.is_available() -> native device discovery.
+
+Reproducer2: job82785, one GPU on lora, three fresh Python interpreters.
+1. import torch; torch.cuda.is_available(): SIGSEGV, exit -11.
+2. import train_ldm_only; torch.cuda.is_available(): SIGSEGV, exit -11.
+3. CUDA initialization before training imports: SIGSEGV, exit -11.
+LD_LIBRARY_PATH and LD_PRELOAD were unset in these probes.
+Thus compilation, model execution, BF16 operations, extra training imports, and multi-GPU
+synchronization are unnecessary to reproduce this failure.
+
+Control: job82787 on deepmedic2, same shared virtual environment and probe script.
+Plain torch CUDA discovery and allocation pass.
+Training imports followed by CUDA discovery and allocation pass.
+See cuda_init_control_82787.log for the complete third probe and final job output.
+
+Conclusion: a node-dependent native CUDA initialization failure on lora is established.
+The exact failing native library/instruction and driver/hardware cause are not established.
+This is separate from the previously reproduced backward-autocast gradient failure.
+The nvidia-smi snapshot precedes training; its zero process/memory display is not evidence
+that CUDA runtime initialization succeeds, or that GPU memory was exhausted.
+
+Workaround: add #SBATCH --exclude=lora to the gpus48 sbatch block in the launch script.
+This avoids the node reproducing the startup failure. It does not certify torch.compile or
+long-term numerical stability; those are later stages requiring their own validation.
+The currently running uncompiled FP32 job82754 on loki was not modified or interrupted.
+
+Diagnostic files added: diagnose_native_startup.py, diagnose_cuda_init.py.
+No training source or launch settings were changed by this diagnosis.
+Queued diagnostic82786 was canceled before running; control82787 replaced it.
+
+Remote logs:
+checkpoints/native_startup.82784.log
+checkpoints/cuda_init_probes.82785.log
+checkpoints/cuda_init_control.82787.log

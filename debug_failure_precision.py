@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 from pathlib import Path
 import sys
 
@@ -35,7 +36,7 @@ def move(value, device):
     return value
 
 
-def replay(checkpoint, snapshot, mode, device, rank):
+def replay(checkpoint, snapshot, mode, device, rank, distributed=False, minimal_trace=False, use_accelerate=False, backward_precision="no", prepared_autocast_only=False):
     from models.sit import SiT_models
 
     args = checkpoint["args"]
@@ -57,6 +58,7 @@ def replay(checkpoint, snapshot, mode, device, rank):
     model.to(device).train()
     model.bn.eval()
     report = {"rank": rank, "mode": mode, "trace": {}, "backward_nonfinite_order": []}
+    report["checkpoint_args"] = args if isinstance(args, dict) else vars(args)
     handles = []
     linear_inputs = {}
     suspect = {x["name"].removesuffix(".weight") for x in snapshot.get("bad_grad_stats", [])
@@ -88,14 +90,51 @@ def replay(checkpoint, snapshot, mode, device, rank):
                         row["weight_grad_reference_fp64"] = stats(ref)
                         row["weight_grad_operand_x"] = stats(x)
                         row["weight_grad_operand_dy"] = stats(dy)
+                        saved_grad = snapshot.get("bad_grad_tensors", {}).get(name + ".weight")
+                        if saved_grad is not None:
+                            saved_bad = ~torch.isfinite(saved_grad.to(device))
+                            # Test the FP16-range hypothesis without changing the model:
+                            # a hidden cast of an activation above 65504 would corrupt
+                            # a whole column of dW, while a cast of dW itself can
+                            # overflow individual entries before rank averaging.
+                            with torch.autocast("cuda", enabled=False):
+                                x_bf16 = x.to(gradient.dtype)
+                                exact = dy.double().T @ x_bf16.double()
+                                cast_x = dy.double().T @ x_bf16.half().double()
+                                cast_dw = exact.half().double()
+                            row["fp16_range_hypothesis"] = {
+                                "saved_bad_count": int(saved_bad.sum()),
+                                "saved_bad_columns": torch.where(saved_bad.any(dim=0))[0].cpu().tolist(),
+                                "saved_bad_rows": torch.where(saved_bad.any(dim=1))[0].cpu().tolist(),
+                                "activation_over_fp16": int((x_bf16.float().abs() > 65504).sum()),
+                                "activation_over_fp16_columns": torch.where((x_bf16.float().abs() > 65504).any(dim=0))[0].cpu().tolist(),
+                                "cast_activation_bad_count": int((~torch.isfinite(cast_x)).sum()),
+                                "cast_activation_mask_matches_saved": bool(torch.equal(~torch.isfinite(cast_x), saved_bad)),
+                                "cast_weight_grad_bad_count": int((~torch.isfinite(cast_dw)).sum()),
+                                "cast_weight_grad_mask_matches_saved": bool(torch.equal(~torch.isfinite(cast_dw), saved_bad)),
+                            }
                 output.register_hook(grad_record)
         return record
 
-    for name, module in model.named_modules():
+    for name, module in ([] if minimal_trace else model.named_modules()):
         if (isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm))
                 or name in {"x_embedder", "t_embedder", "parent_embedder"}
                 or (name.startswith("blocks.") and name.count(".") == 1)):
             handles.append(module.register_forward_hook(hook(name)))
+
+    base_model = model
+    accelerator = None
+    if use_accelerate:
+        from accelerate import Accelerator
+        accelerator = Accelerator(mixed_precision=snapshot.get("mixed_precision", get("mixed_precision", "bf16")))
+        if distributed:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            base_model = model
+        model = accelerator.prepare(model)
+        report["accelerator_precision"] = accelerator.mixed_precision
+        report["accelerator_scaler"] = type(accelerator.scaler).__name__
+    elif distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index])
 
     saved_reduction = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     saved_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -117,7 +156,8 @@ def replay(checkpoint, snapshot, mode, device, rank):
     torch.cuda.set_rng_state(rng["cuda"], device)
     precision = snapshot.get("mixed_precision", get("mixed_precision", "bf16"))
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
-    enabled = mode != "fp32" and precision != "no"
+    enabled = mode != "fp32" and precision != "no" and not prepared_autocast_only
+    report["prepared_autocast_only"] = prepared_autocast_only
     attention_context = (torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True,
                          enable_mem_efficient=False) if mode == "bf16-math-attention"
                          else contextlib.nullcontext())
@@ -135,13 +175,30 @@ def replay(checkpoint, snapshot, mode, device, rank):
         report["saved_loss"] = snapshot.get("losses", {}).get("sit_loss")
         report["time"] = out["time_input"].detach().flatten().cpu().tolist()
         report["noise"] = stats(out["noises"])
-        loss.backward()
-        report["bad_parameters"] = {name: stats(p.grad) for name, p in model.named_parameters()
+        backward_dtype = torch.float16 if backward_precision == "fp16" else dtype
+        report["backward_precision"] = backward_precision
+        with torch.autocast("cuda", dtype=backward_dtype, enabled=backward_precision != "no"):
+            if accelerator is not None:
+                accelerator.backward(loss)
+            else:
+                loss.backward()
+        report["bad_parameters"] = {name: stats(p.grad) for name, p in base_model.named_parameters()
                                     if p.grad is not None and not torch.isfinite(p.grad).all()}
         for name in suspect:
-            module = model.get_submodule(name)
+            module = base_model.get_submodule(name)
             if module.weight.grad is not None:
-                report["trace"][name]["actual_weight_grad"] = stats(module.weight.grad)
+                report["trace"].setdefault(name, {})["actual_weight_grad"] = stats(module.weight.grad)
+                saved = snapshot.get("bad_grad_tensors", {}).get(name + ".weight")
+                if saved is not None:
+                    saved = saved.to(device)
+                    actual = module.weight.grad
+                    finite = torch.isfinite(actual) & torch.isfinite(saved)
+                    report["trace"][name]["saved_comparison"] = {
+                        "same_nan_mask": bool(torch.equal(torch.isnan(saved), torch.isnan(actual))),
+                        "same_posinf_mask": bool(torch.equal(torch.isposinf(saved), torch.isposinf(actual))),
+                        "same_neginf_mask": bool(torch.equal(torch.isneginf(saved), torch.isneginf(actual))),
+                        "finite_absmax_difference": float((actual[finite] - saved[finite]).abs().max()) if finite.any() else None,
+                    }
     except Exception as exc:
         report["error"] = repr(exc)
     finally:
@@ -150,6 +207,8 @@ def replay(checkpoint, snapshot, mode, device, rank):
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = saved_reduction
         torch.backends.cuda.matmul.allow_tf32 = saved_tf32
         torch.backends.cudnn.allow_tf32 = saved_cudnn_tf32
+        if accelerator is not None:
+            accelerator.free_memory()
     return report
 
 
@@ -159,24 +218,44 @@ def main():
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, default=Path("failure_precision_report.json"))
     parser.add_argument("--ranks", type=int, nargs="+", default=[0, 1])
+    parser.add_argument("--distributed", action="store_true")
+    parser.add_argument("--minimal-trace", action="store_true", help="Avoid activation hooks to preserve original execution timing")
+    parser.add_argument("--accelerate", action="store_true", help="Use the training script's Accelerate model wrapper and backward")
+    parser.add_argument("--backward-precision", choices=["no", "forward", "fp16"], default="no")
+    parser.add_argument("--prepared-autocast-only", action="store_true", help="Match the one-line training fix: rely on prepared forward autocast, with backward outside autocast")
     parser.add_argument("--modes", nargs="+", default=["baseline", "fp32", "bf16-safe-reduction", "bf16-math-attention"],
                         choices=["baseline", "fp32", "bf16-safe-reduction", "bf16-math-attention"])
     opts = parser.parse_args()
+    if opts.accelerate and opts.modes != ["baseline"]:
+        parser.error("--accelerate requires --modes baseline so its autocast wrapper cannot override precision controls")
+    if opts.prepared_autocast_only and not opts.accelerate:
+        parser.error("--prepared-autocast-only requires --accelerate")
     sys.path.insert(0, str(opts.repo_root.resolve()))
     if not torch.cuda.is_available():
         raise RuntimeError("Run this diagnostic on an allocated GPU, not the login server")
     torch.set_num_threads(2)
+    if opts.distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group("nccl")
+        opts.ranks = [torch.distributed.get_rank()]
+        opts.output = opts.output.with_name(opts.output.stem + f".rank{opts.ranks[0]}" + opts.output.suffix)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda", 0)
     checkpoint = torch.load(opts.failure_dir / "model_before_failure.pt", map_location="cpu", weights_only=False)
     reports = {"torch": torch.__version__, "cuda": torch.version.cuda,
                "gpu": torch.cuda.get_device_name(), "failure_dir": str(opts.failure_dir), "results": []}
     for rank in opts.ranks:
         snapshot = torch.load(opts.failure_dir / f"rank_{rank}.pt", map_location="cpu", weights_only=False)
         for mode in opts.modes:
-            result = replay(checkpoint, snapshot, mode, torch.device("cuda:0"), rank)
+            result = replay(checkpoint, snapshot, mode, device, rank, opts.distributed, opts.minimal_trace, opts.accelerate, opts.backward_precision, opts.prepared_autocast_only)
             reports["results"].append(result)
             opts.output.write_text(json.dumps(reports, indent=2, allow_nan=False))
             print(json.dumps({k: v for k, v in result.items() if k != "trace"}), flush=True)
             torch.cuda.empty_cache()
+    if opts.distributed:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
