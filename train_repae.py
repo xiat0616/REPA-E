@@ -378,6 +378,32 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    # Apply the same linear warmup length to SiT, VAE and discriminator.
+    # Each optimizer ramps to its own configured learning rate; 0 disables all warmup.
+    if args.lr_warmup_steps > 0:
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0 / args.lr_warmup_steps,
+            end_factor=1.0,
+            total_iters=args.lr_warmup_steps,
+        )
+        lr_scheduler_vae = torch.optim.lr_scheduler.LinearLR(
+            optimizer_vae,
+            start_factor=1.0 / args.lr_warmup_steps,
+            end_factor=1.0,
+            total_iters=args.lr_warmup_steps,
+        )
+        lr_scheduler_disc = torch.optim.lr_scheduler.LinearLR(
+            optimizer_loss_fn,
+            start_factor=1.0 / args.lr_warmup_steps,
+            end_factor=1.0,
+            total_iters=args.lr_warmup_steps,
+        )
+    else:
+        lr_scheduler = None
+        lr_scheduler_vae = None
+        lr_scheduler_disc = None
+
     # Set up dataset
     dataset_cfg = DatasetConfig(
         data_dir=args.data_dir,
@@ -448,6 +474,27 @@ def main(args):
         optimizer_vae.load_state_dict(ckpt['opt_vae'])
         optimizer_loss_fn.load_state_dict(ckpt['opt_disc'])
 
+        if lr_scheduler is not None:
+            if ckpt.get('scheduler') is not None:
+                lr_scheduler.load_state_dict(ckpt['scheduler'])
+            else:
+                # Missing scheduler state: preserve the restored optimizer LR without restarting warmup.
+                lr_scheduler = None
+                run_logger.info('SiT checkpoint has no scheduler state; keeping the restored learning rate without warmup.')
+        if lr_scheduler_vae is not None:
+            if ckpt.get('scheduler_vae') is not None:
+                lr_scheduler_vae.load_state_dict(ckpt['scheduler_vae'])
+            else:
+                # Missing scheduler state: preserve the restored optimizer LR without restarting warmup.
+                lr_scheduler_vae = None
+                run_logger.info('VAE checkpoint has no scheduler state; keeping the restored learning rate without warmup.')
+        if lr_scheduler_disc is not None:
+            if ckpt.get('scheduler_disc') is not None:
+                lr_scheduler_disc.load_state_dict(ckpt['scheduler_disc'])
+            else:
+                # Missing scheduler state: preserve the restored optimizer LR without restarting warmup.
+                lr_scheduler_disc = None
+                run_logger.info('discriminator checkpoint has no scheduler state; keeping the restored learning rate without warmup.')
         global_step = ckpt['steps']
 
     # Allow larger cache size for DYNAMo compilation
@@ -575,6 +622,9 @@ def main(args):
                     grad_norm_vae = torch.nn.utils.clip_grad_norm_(vae.parameters(), args.max_grad_norm)
 
                 optimizer_vae.step()
+                # Advance warmup once per successful VAE update, not per microbatch.
+                if accelerator.sync_gradients and not optimizer_vae.step_was_skipped and lr_scheduler_vae is not None:
+                    lr_scheduler_vae.step()
                 optimizer_vae.zero_grad(set_to_none=True)
 
                 # Discriminator loss and update (continuation of step 2).
@@ -598,6 +648,9 @@ def main(args):
                     grad_norm_disc = torch.nn.utils.clip_grad_norm_(vae_loss_fn.parameters(), args.max_grad_norm)
 
                 optimizer_loss_fn.step()
+                # Advance warmup once per successful discriminator update, not per microbatch.
+                if accelerator.sync_gradients and not optimizer_loss_fn.step_was_skipped and lr_scheduler_disc is not None:
+                    lr_scheduler_disc.step()
                 optimizer_loss_fn.zero_grad(set_to_none=True)
 
                 # Turn the grads back on for the SiT model, and put the model into training mode.
@@ -631,6 +684,9 @@ def main(args):
                     grad_norm_sit = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optimizer.step()
+                # Advance warmup once per successful SiT update, not per microbatch.
+                if accelerator.sync_gradients and not optimizer.step_was_skipped and lr_scheduler is not None:
+                    lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 # 5). Update SiT EMA
@@ -658,6 +714,9 @@ def main(args):
                     'train/d_loss': accelerator.gather(d_loss).mean().detach().item(),
                     'train/grad_norm_vae': accelerator.gather(grad_norm_vae).mean().detach().item(),
                     'train/grad_norm_disc': accelerator.gather(grad_norm_disc).mean().detach().item(),
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'train/vae_learning_rate': optimizer_vae.param_groups[0]['lr'],
+                    'train/disc_learning_rate': optimizer_loss_fn.param_groups[0]['lr'],
                     'epoch': epoch,
                 }
 
@@ -682,6 +741,9 @@ def main(args):
                         'opt': optimizer.state_dict(),
                         'opt_vae': optimizer_vae.state_dict(),
                         'opt_disc': optimizer_loss_fn.state_dict(),
+                        'scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
+                        'scheduler_vae': lr_scheduler_vae.state_dict() if lr_scheduler_vae is not None else None,
+                        'scheduler_disc': lr_scheduler_disc.state_dict() if lr_scheduler_disc is not None else None,
                         'args': args,
                         'steps': global_step,
                     }
@@ -810,6 +872,8 @@ def parse_args(input_args=None):
     parser.add_argument('--checkpointing-steps', type=int, default=50000)
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--lr-warmup-steps', type=int, default=2000,
+                        help='Linear warmup updates for SiT, VAE and discriminator; 0 disables all warmup.')
     parser.add_argument('--adam-beta1', type=float, default=0.9)
     parser.add_argument('--adam-beta2', type=float, default=0.999)
     parser.add_argument('--adam-weight-decay', type=float, default=0.)

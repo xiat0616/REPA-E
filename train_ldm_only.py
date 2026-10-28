@@ -35,6 +35,7 @@ CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
+# Preprocess the clean image for the fixed visual teacher, independently of the VAE.
 def preprocess_raw_image(x, enc_type):
     h, w = x.shape[-2:]
     if 'clip' in enc_type:
@@ -68,6 +69,7 @@ def update_ema(ema_model, model, decay=0.9999):
         name = name.replace('module.', '')
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
+    # Also copy/average buffers, including the fixed latent normalization statistics.
     ema_buffers = OrderedDict(ema_model.named_buffers())
     model_buffers = OrderedDict(model.named_buffers())
 
@@ -99,103 +101,6 @@ def original_model(accelerator, model, compiled=False):
     return model._orig_mod if compiled and hasattr(model, '_orig_mod') else model
 
 
-def _snapshot_value(x):
-    if torch.is_tensor(x):
-        return x.detach().cpu()
-    if isinstance(x, dict):
-        return {k: _snapshot_value(v) for k, v in x.items()}
-    if isinstance(x, list):
-        return [_snapshot_value(v) for v in x]
-    if isinstance(x, tuple):
-        return tuple(_snapshot_value(v) for v in x)
-    if isinstance(x, (str, int, float, bool, type(None))):
-        return x
-    return repr(x)
-
-
-def capture_rng_state(device):
-    state = {'cpu': torch.get_rng_state()}
-    if device.type == 'cuda':
-        state['cuda'] = torch.cuda.get_rng_state(device).cpu()
-    return state
-
-
-def collect_bad_gradients(model):
-    bad_grad_stats = []
-    bad_grad_tensors = {}
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            continue
-        grad = p.grad.detach()
-        finite_mask = torch.isfinite(grad)
-        if finite_mask.all():
-            continue
-        finite = grad[finite_mask]
-        bad_grad_stats.append({
-            'name': name,
-            'shape': tuple(grad.shape),
-            'dtype': str(grad.dtype),
-            'finite_absmax': finite.abs().max().item() if finite.numel() else float('nan'),
-            'num_nan': torch.isnan(grad).sum().item(),
-            'num_posinf': torch.isposinf(grad).sum().item(),
-            'num_neginf': torch.isneginf(grad).sum().item(),
-            'numel': grad.numel(),
-        })
-        bad_grad_tensors[name] = grad.cpu()
-    return bad_grad_stats, bad_grad_tensors
-
-
-def save_failure_snapshot(
-    accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
-    reason, z=None, parents=None, zs=None, raw_image=None, batch=None,
-    forward_rng_state=None, losses=None, bad_grad_stats=None, bad_grad_tensors=None,
-):
-    failing_step = global_step + 1
-    rank = accelerator.process_index
-    step_dir = os.path.join(failure_dir, f'step_{failing_step:07d}')
-    os.makedirs(step_dir, exist_ok=True)
-
-    rank_snapshot = {
-        'failing_step': failing_step,
-        'rank': rank,
-        'reason': reason,
-        'mixed_precision': args.mixed_precision,
-        'compile': args.compile,
-        'fused_attn': args.fused_attn,
-        'qk_norm': args.qk_norm,
-        'z': _snapshot_value(z),
-        'parents': _snapshot_value(parents),
-        'zs': _snapshot_value(zs),
-        'raw_image': _snapshot_value(raw_image),
-        'batch': _snapshot_value(batch),
-        'forward_rng_state': _snapshot_value(forward_rng_state),
-        'losses': losses or {},
-        'bad_grad_stats': bad_grad_stats or [],
-        'bad_grad_tensors': bad_grad_tensors or {},
-    }
-    rank_path = os.path.join(step_dir, f'rank_{rank}.pt')
-    torch.save(rank_snapshot, rank_path)
-    print(f'[rank{rank}] Saved failure inputs to {rank_path}', flush=True)
-
-    if accelerator.is_main_process:
-        base_model = original_model(accelerator, model, args.compile)
-        checkpoint = {
-            'model': base_model.state_dict(),
-            'ema': ema.state_dict(),
-            'opt': optimizer.state_dict(),
-            'scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
-            'args': args,
-            'steps': global_step,
-            'failing_step': failing_step,
-            'reason': reason,
-        }
-        checkpoint_path = os.path.join(step_dir, 'model_before_failure.pt')
-        torch.save(checkpoint, checkpoint_path)
-        print(f'[rank0] Saved pre-update model checkpoint to {checkpoint_path}', flush=True)
-
-    return step_dir
-
-
 def batch_to_parents(batch, device):
     pa = batch['pa']
     return {
@@ -206,6 +111,7 @@ def batch_to_parents(batch, device):
     }
 
 
+# Teacher features are fixed targets: no gradients or optimizer updates for the encoder.
 @torch.no_grad()
 def extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator):
     zs = []
@@ -221,9 +127,11 @@ def extract_encoder_features(raw_image, encoders, encoder_types, architectures, 
     return zs
 
 
+# Original REPA keeps the pretrained VAE fixed and samples its posterior latents.
 @torch.no_grad()
 def encode_vae_latent(vae, raw_image):
     processed_image = preprocess_imgs_vae(raw_image)
+    # Encode in FP32 even when SiT training uses BF16/FP16 autocast.
     with torch.autocast(device_type=raw_image.device.type, enabled=False):
         _, z, _ = vae(processed_image.float())
     return z.float()
@@ -234,6 +142,7 @@ def validate_sit(model, vae, val_dataloader, encoders, encoder_types, architectu
     use_repa = args.proj_coeff > 0
     model.eval()
     vae.eval()
+    # Validation uses the same denoising + weighted REPA objective as training.
     sums = torch.zeros(4, device=accelerator.device, dtype=torch.float32)
 
     for i, batch in enumerate(val_dataloader):
@@ -277,7 +186,12 @@ def validate_sit(model, vae, val_dataloader, encoders, encoder_types, architectu
     }
 
 
+#################################################################################
+#                   Original REPA baseline: keep the VAE fixed                    #
+#################################################################################
+
 def main(args):
+    # Set up Accelerate for distributed training, accumulation and mixed precision.
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
@@ -287,14 +201,13 @@ def main(args):
         project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir),
     )
 
+    # Set up logging, regular checkpoints and evaluation outputs.
     save_dir = os.path.join(args.output_dir, args.exp_name)
     checkpoint_dir = os.path.join(save_dir, 'checkpoints')
     sample_dir = os.path.join(save_dir, 'samples')
     recon_dir = os.path.join(save_dir, 'reconstructions')
     counterfactual_dir = os.path.join(save_dir, 'counterfactuals')
-    failure_dir = os.path.join(save_dir, 'failures')
     validation_path = os.path.join(save_dir, 'validation_metrics.jsonl')
-    os.makedirs(failure_dir, exist_ok=True)
 
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -320,6 +233,7 @@ def main(args):
 
     image_size = (args.height, args.width)
 
+    # Determine the frozen VAE latent shape and number of channels.
     if args.vae == 'f8d4':
         assert args.height % 8 == 0 and args.width % 8 == 0
         latent_size = (args.height // 8, args.width // 8)
@@ -331,8 +245,10 @@ def main(args):
     else:
         raise NotImplementedError()
 
+    # proj_coeff > 0: denoising + REPA alignment; proj_coeff = 0: plain SiT.
     use_repa = args.proj_coeff > 0
 
+    # Load fixed clean-image teachers only when alignment is enabled.
     if use_repa:
         encoders, encoder_types, architectures = load_encoders(args.enc_type, device, image_size)
         z_dims = [encoder.embed_dim for encoder in encoders]
@@ -340,6 +256,8 @@ def main(args):
         encoders, encoder_types, architectures = [], [], []
         z_dims = []
 
+    # SiT contains the trainable projection MLPs attached at encoder_depth.
+    # With DINOv2, f8d4 + /2 and f16d32 + /1 give matching spatial token grids.
     model = SiT_models[args.model](
         input_size=latent_size,
         in_channels=in_channels,
@@ -351,9 +269,11 @@ def main(args):
         qk_norm=args.qk_norm,
     ).to(device)
 
+    # EMA is a separate SiT copy, updated by averaging; it has no optimizer.
     ema = copy.deepcopy(model).to(device)
     requires_grad(ema, False)
 
+    # Fixed VAE: normalize latents with fixed dataset/resolution statistics.
     stats_path = Path(args.vae_ckpt).parent / f'embed_{args.vae}_{args.height}x{args.width}_latent_stats.pt'
     if not stats_path.exists():
         raise FileNotFoundError(
@@ -391,6 +311,7 @@ def main(args):
     vae.load_state_dict(vae_ckpt, strict=False)
     del vae_ckpt
 
+    # Freeze both VAE encoder and decoder. Original REPA does not train the VAE or a GAN.
     requires_grad(vae, False)
     vae.eval()
     vae.float()
@@ -405,6 +326,7 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    # Optimize SiT and its projection heads together; VAE and teachers are excluded.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -413,6 +335,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    # Optional local recipe: use --lr-warmup-steps 0 for the paper's constant learning rate.
     if args.lr_warmup_steps > 0:
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
@@ -423,6 +346,7 @@ def main(args):
     else:
         lr_scheduler = None
 
+    # EMBED adaptation: aligned images and age/view/density/scanner conditions.
     dataset_cfg = DatasetConfig(
         data_dir=args.data_dir,
         split_dir=args.split_dir,
@@ -464,12 +388,14 @@ def main(args):
         run_logger.info(f"Train: {len(datasets['train']):,} | Valid: {len(datasets['valid']):,}")
         run_logger.info(f'Global batch: {args.batch_size} | Local batch/GPU: {local_batch_size}')
 
+    # Initialize the EMA copy from the current SiT before optionally resuming.
     update_ema(ema, model, decay=0)
     model.eval()
     ema.eval()
 
     global_step = 0
 
+    # Restore trainable/EMA weights, optimizer state, step and optional warmup state.
     if args.resume_step > 0:
         if args.continue_train_exp_dir is None:
             raise ValueError('--continue-train-exp-dir is required when --resume-step > 0.')
@@ -480,8 +406,13 @@ def main(args):
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
-        if lr_scheduler is not None and ckpt.get('scheduler') is not None:
-            lr_scheduler.load_state_dict(ckpt['scheduler'])
+        if lr_scheduler is not None:
+            if ckpt.get('scheduler') is not None:
+                lr_scheduler.load_state_dict(ckpt['scheduler'])
+            else:
+                # Original REPA checkpoints have no scheduler; keep their restored learning rate.
+                lr_scheduler = None
+                run_logger.info('Checkpoint has no scheduler state; keeping the restored learning rate without warmup.')
         global_step = ckpt['steps']
 
         # Keep latent normalization tied to the current dataset/resolution stats.
@@ -491,9 +422,11 @@ def main(args):
     torch._dynamo.config.cache_size_limit = 64
     torch._dynamo.config.accumulated_cache_size_limit = 512
 
+    # Compile SiT only; the VAE and visual teachers remain fixed.
     if args.compile:
         model = torch.compile(model, backend='inductor', mode='default')
 
+    # Wrap the trainable model and optimizer for distributed/mixed-precision training.
     model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader
     )
@@ -512,40 +445,34 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    # Keep sampling noise and conditions fixed for comparisons across checkpoints.
     xT, sample_parents = prepare_ema_sampling_inputs(
         val_dataloader, accelerator, args, in_channels, latent_size
     )
 
+    # Main training loop: original REPA, without end-to-end VAE tuning.
     for epoch in range(args.epochs):
         for batch in train_dataloader:
             raw_image = batch['x'].to(device).repeat(1, 3, 1, 1) * 255.0
             parents = batch_to_parents(batch, device)
 
+            # 1). Extract clean-image patch features from the fixed teacher.
             zs = (
                 extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator)
                 if use_repa else None
             )
 
+            # 2). Encode/sample latents using the frozen VAE; no VAE backward pass.
             z = encode_vae_latent(vae, raw_image)
-
-            if not torch.isfinite(z).all():
-                reason = f'Non-finite VAE latent at step {global_step + 1}.'
-                save_failure_snapshot(
-                    accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
-                    reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
-                )
-                raise FloatingPointError(reason)
 
             with accelerator.accumulate(model):
                 model.train()
                 base_model = original_model(accelerator, model, args.compile)
+                # model.train() enables condition dropout; keep latent BN statistics fixed.
                 base_model.bn.eval()
 
-                # Save the exact RNG state immediately before SiT forward. The flow model samples
-                # t/noise internally, so restoring this state with the saved z/parents reproduces
-                # the same stochastic training example without modifying models/sit.py.
-                forward_rng_state = capture_rng_state(device)
-
+                # 3). Forward pass: SiT samples time/noise, predicts velocity, and projects hidden tokens.
+                # The REPA term is negative cosine similarity at matching teacher/SiT token positions.
                 # Keep backward and optimizer updates outside autocast.
                 with accelerator.autocast():
                     sit_outputs = model(
@@ -562,57 +489,14 @@ def main(args):
 
                     denoising_loss = sit_outputs['denoising_loss'].mean()
                     proj_loss = sit_outputs['proj_loss'].mean()
+                    # L = L_velocity + proj_coeff * L_REPA (standard REPA, not alignment alone).
                     sit_loss = denoising_loss + args.proj_coeff * proj_loss if use_repa else denoising_loss
-                losses = {
-                    'sit_loss': sit_loss.detach().float().item(),
-                    'denoising_loss': denoising_loss.detach().float().item(),
-                    'proj_loss': proj_loss.detach().float().item(),
-                }
 
-                if not torch.isfinite(sit_loss):
-                    reason = (
-                        f'Non-finite loss at step {global_step + 1}: '
-                        f'denoise={denoising_loss.item()}, proj={proj_loss.item()}'
-                    )
-                    save_failure_snapshot(
-                        accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
-                        reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
-                        forward_rng_state=forward_rng_state, losses=losses,
-                    )
-                    raise FloatingPointError(reason)
-
+                # 4). Backpropagate into SiT and its projection heads, clip, and update.
                 accelerator.backward(sit_loss)
-
-                base_model = original_model(accelerator, model, args.compile)
-                bad_grad_stats, bad_grad_tensors = collect_bad_gradients(base_model)
-                if bad_grad_stats:
-                    first = bad_grad_stats[0]
-                    reason = (
-                        f'Non-finite gradients at step {global_step + 1}: {len(bad_grad_stats)} parameter(s); '
-                        f'first={first["name"]}, shape={first["shape"]}, finite_absmax={first["finite_absmax"]}, '
-                        f'nan={first["num_nan"]}, +inf={first["num_posinf"]}, -inf={first["num_neginf"]}'
-                    )
-                    for item in bad_grad_stats:
-                        print(f'[rank{accelerator.process_index}] bad_grad: {item}', flush=True)
-                    save_failure_snapshot(
-                        accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
-                        reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
-                        forward_rng_state=forward_rng_state, losses=losses,
-                        bad_grad_stats=bad_grad_stats, bad_grad_tensors=bad_grad_tensors,
-                    )
-                    raise FloatingPointError(reason)
 
                 if accelerator.sync_gradients:
                     grad_norm_sit = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                    if not torch.isfinite(torch.as_tensor(grad_norm_sit, device=device)):
-                        reason = f'Non-finite gradient norm at step {global_step + 1}: {grad_norm_sit}'
-                        save_failure_snapshot(
-                            accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
-                            reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
-                            forward_rng_state=forward_rng_state, losses=losses,
-                        )
-                        raise FloatingPointError(reason)
 
                 optimizer.step()
 
@@ -621,6 +505,7 @@ def main(args):
 
                 optimizer.zero_grad(set_to_none=True)
 
+                # 5). Update SiT EMA once per synchronized training update.
                 if accelerator.sync_gradients:
                     update_ema(ema, original_model(accelerator, model, args.compile))
 
@@ -646,6 +531,7 @@ def main(args):
 
                 accelerator.log(logs, step=global_step)
 
+                # Save unwrapped model/EMA weights and optimizer/scheduler state for resume.
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                     base_model = original_model(accelerator, model, args.compile)
 
@@ -662,6 +548,7 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     run_logger.info(f'Saved checkpoint to {checkpoint_path}')
 
+                # Validate the objective and plot reconstructions/counterfactuals.
                 if global_step == 1 or global_step % args.validation_steps == 0:
                     val_logs = validate_sit(
                         model,
@@ -719,6 +606,7 @@ def main(args):
                         run_logger.info(f'Saved flow inversion reconstructions to {recon_path}')
                         run_logger.info(f'Saved counterfactuals to {counterfactual_path}')
 
+                # Generate with EMA SiT, then decode with the same fixed VAE.
                 if global_step == 1 or global_step % args.sampling_steps == 0:
                     out_samples = generate_ema_samples(
                         ema,
@@ -774,6 +662,7 @@ def parse_args(input_args=None):
     parser.add_argument('--continue-train-exp-dir', type=str, default=None)
 
     parser.add_argument('--model', type=str, default='SiT-B/2', choices=SiT_models.keys())
+    # Alignment block: the original paper uses block 4 for SiT-B and block 8 for SiT-L/XL.
     parser.add_argument('--encoder-depth', type=int, default=8)
     parser.add_argument('--qk-norm', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--fused-attn', action=argparse.BooleanOptionalAction, default=True)
