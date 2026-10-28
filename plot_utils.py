@@ -151,7 +151,8 @@ def encode_flow_input(ema, vae, images):
     raw_image = images.repeat(1, 3, 1, 1) * 255.0
     processed_image = preprocess_imgs_vae(raw_image)
     with torch.autocast(device_type=raw_image.device.type, enabled=False):
-        posterior, _, _ = vae(processed_image.float())
+        # Call encode directly: a prepared trainable VAE may autocast its forward.
+        posterior = vae.encode(processed_image.float())
         z = posterior.mode().float()
     return ema.bn(z)
 

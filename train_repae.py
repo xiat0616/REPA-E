@@ -2,7 +2,6 @@ import argparse
 import copy
 import json
 import logging
-import math
 import os
 from collections import OrderedDict
 from pathlib import Path
@@ -17,15 +16,17 @@ from omegaconf import OmegaConf
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torch.utils.data import DataLoader
 from torchvision.transforms import Normalize
-from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 from data_handle.embed import DatasetConfig, get_embed
 from loss.losses import ReconstructionLoss_Single_Stage
 from models.autoencoder import vae_models
 from models.sit import SiT_models
-from samplers import euler_sampler
-from utils import load_encoders, denormalize_latents, preprocess_imgs_vae, count_trainable_params
+from utils import load_encoders, preprocess_imgs_vae, count_trainable_params
+from plot_utils import (
+    array2grid, comparison_figure_to_array, generate_ema_samples,
+    make_counterfactual_grid, make_flow_reconstruction_grid, prepare_ema_sampling_inputs,
+)
 
 
 logger = get_logger(__name__)
@@ -52,13 +53,6 @@ def preprocess_raw_image(x, enc_type):
         x = torch.nn.functional.interpolate(x, size=(14 * (h // 16), 14 * (w // 16)), mode='bicubic', align_corners=False)
 
     return x
-
-
-def array2grid(x, nrow=None):
-    if nrow is None:
-        nrow = max(1, round(math.sqrt(x.size(0))))
-    x = make_grid(x.clamp(0, 1), nrow=nrow, value_range=(0, 1))
-    return x.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
 
 
 def append_jsonl(path, row):
@@ -109,15 +103,11 @@ def original_model(accelerator, model, compiled=False):
 def batch_to_parents(batch, device):
     pa = batch['pa']
     return {
-        'age': pa['age'].to(device),
-        'view': pa['view'].argmax(dim=1).long().to(device),
-        'density': pa['density'].argmax(dim=1).long().to(device),
-        'scanner': pa['scanner'].argmax(dim=1).long().to(device),
+        'age': pa['age'].float().to(device),
+        'view': pa['view'].float().to(device),
+        'density': pa['density'].float().to(device),
+        'scanner': pa['scanner'].float().to(device),
     }
-
-
-def slice_parents(parents, n):
-    return {k: v[:n] for k, v in parents.items()}
 
 
 @torch.no_grad()
@@ -240,44 +230,20 @@ def make_reconstruction_grid(vae, val_dataloader, accelerator, args):
         return None
 
     n = min(args.num_recon_images, originals.shape[0], recons.shape[0])
-    paired = torch.cat([originals[:n], recons[:n]], dim=0)
-    return array2grid(paired, nrow=n)
+    return comparison_figure_to_array(originals[:n], [recons[:n]], ['VAE reconstruction'])
 
-
-@torch.no_grad()
-def generate_ema_samples(ema, vae, xT, parents, in_channels, accelerator, args):
-    ema.eval()
-    vae.eval()
-
-    samples = euler_sampler(
-        ema,
-        xT,
-        parents,
-        num_steps=args.sample_num_steps,
-        cfg_scale=args.sample_cfg_scale,
-        guidance_low=0.,
-        guidance_high=1.,
-        path_type=args.path_type,
-        heun=False,
-    ).to(torch.float32)
-
-    latents_stats = ema.extract_latents_stats()
-    latents_scale = latents_stats['latents_scale'].view(1, in_channels, 1, 1)
-    latents_bias = latents_stats['latents_bias'].view(1, in_channels, 1, 1)
-
-    samples = vae.decode(denormalize_latents(samples, latents_scale, latents_bias)).sample
-    samples = (samples + 1) / 2.
-
-    return accelerator.gather(samples.to(torch.float32))
-
+#################################################################################
+#                                  Training Loop                                #
+#################################################################################
 
 def main(args):
+    # Set accelerator
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=None if args.report_to == 'none' else args.report_to,
         project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir),
     )
 
@@ -285,12 +251,15 @@ def main(args):
     checkpoint_dir = os.path.join(save_dir, 'checkpoints')
     sample_dir = os.path.join(save_dir, 'samples')
     recon_dir = os.path.join(save_dir, 'reconstructions')
+    counterfactual_dir = os.path.join(save_dir, 'counterfactuals')
     validation_path = os.path.join(save_dir, 'validation_metrics.jsonl')
 
+    # Set up the logger and checkpoint/output directories.
     if accelerator.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(sample_dir, exist_ok=True)
         os.makedirs(recon_dir, exist_ok=True)
+        os.makedirs(counterfactual_dir, exist_ok=True)
 
         with open(os.path.join(save_dir, 'args.json'), 'w') as f:
             json.dump(vars(args), f, indent=4)
@@ -310,18 +279,24 @@ def main(args):
 
     image_size = (args.height, args.width)
 
+    # Create model
     if args.vae == 'f8d4':
-        assert args.height % 8 == 0 and args.width % 8 == 0
+        assert args.height % 8 == 0 and args.width % 8 == 0, "Image dimensions must be divisible by 8 for f8d4 VAE."
         latent_size = (args.height // 8, args.width // 8)
         in_channels = 4
     elif args.vae == 'f16d32':
-        assert args.height % 16 == 0 and args.width % 16 == 0
+        assert args.height % 16 == 0 and args.width % 16 == 0, "Image dimensions must be divisible by 16 for f16d32 VAE."
         latent_size = (args.height // 16, args.width // 16)
         in_channels = 32
     else:
         raise NotImplementedError()
 
-    encoders, encoder_types, architectures = load_encoders(args.enc_type, device, image_size)
+    # Load fixed pretrained encoders (e.g. DINOv2) to provide REPA target features.
+    if args.enc_type != None:
+        encoders, encoder_types, architectures = load_encoders(args.enc_type, device, image_size)
+    else:
+        raise NotImplementedError("Please specify at least one encoder type using --enc-type.")
+    
     z_dims = [encoder.embed_dim for encoder in encoders]
 
     model = SiT_models[args.model](
@@ -335,39 +310,40 @@ def main(args):
         qk_norm=args.qk_norm,
     ).to(device)
 
+    # Make a copy of SiT for EMA; its parameters are updated by averaging, not backward.
     ema = copy.deepcopy(model).to(device)
     requires_grad(ema, False)
 
+    # Load the trainable VAE; the original REPA-E code maintains EMA for SiT only.
     vae = vae_models[args.vae]().to(device)
+    vae_ckpt = torch.load(args.vae_ckpt, map_location='cpu')
+    vae.load_state_dict(vae_ckpt, strict=False) # We may not have the projection layer in the VAE
 
-    vae_ckpt = torch.load(args.vae_ckpt, map_location=device)
-    vae.load_state_dict(vae_ckpt, strict=False)
     del vae_ckpt
 
     if accelerator.is_main_process:
         run_logger.info(f'Total trainable params in VAE: {count_trainable_params(vae):,}')
 
-    latents_stats = torch.load(args.vae_ckpt.replace('.pt', '-latents-stats.pt'), map_location='cpu')
-    latents_scale = latents_stats['latents_scale'].squeeze().to(device)
-    latents_bias = latents_stats['latents_bias'].squeeze().to(device)
+    # Initialize latent BN from pretrained VAE statistics (paper Sec. 3.2).
+    # During joint training, BN tracks the changing VAE latent mean and variance.
+    stats_path = Path(args.vae_ckpt).parent / f'embed_{args.vae}_{args.height}x{args.width}_latent_stats.pt'
+    latents_stats = torch.load(stats_path, map_location='cpu')
+    latents_bias = latents_stats['mean'].squeeze().float().to(device)
+    latents_scale = latents_stats['std'].squeeze().float().reciprocal().to(device)
 
     model.init_bn(
         latents_bias=latents_bias,
         latents_scale=latents_scale,
     )
 
+    # Apply SyncBatchNorm if using distributed training
     if accelerator.use_distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
+    # VAE regularization: reconstruction + perceptual + KL + GAN losses.
+    # This module also contains the discriminator and computes its separate loss.
     loss_cfg = OmegaConf.load(args.loss_cfg_path)
     vae_loss_fn = ReconstructionLoss_Single_Stage(loss_cfg).to(device)
-
-    if args.disc_pretrained_ckpt is not None:
-        disc_ckpt = torch.load(args.disc_pretrained_ckpt, map_location=device)
-        vae_loss_fn.discriminator.load_state_dict(disc_ckpt)
-
-        if accelerator.is_main_process:
-            run_logger.info(f'Loaded discriminator from {args.disc_pretrained_ckpt}')
 
     if accelerator.is_main_process:
         run_logger.info(f'SiT Parameters: {sum(p.numel() for p in model.parameters()):,}')
@@ -376,6 +352,8 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    # Set up separate optimizers for SiT, VAE and the discriminator.
+    # The paper uses AdamW with betas=(0.9, 0.999) and a constant learning rate of 1e-4.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -400,6 +378,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    # Set up dataset
     dataset_cfg = DatasetConfig(
         data_dir=args.data_dir,
         split_dir=args.split_dir,
@@ -434,14 +413,25 @@ def main(args):
     if accelerator.is_main_process:
         run_logger.info(f"Train: {len(datasets['train']):,} | Valid: {len(datasets['valid']):,}")
 
-    update_ema(ema, model, decay=0)
+    # Prepare models for training
+    update_ema(ema, model, decay=0)  # Initialize EMA with exactly the current SiT weights.
 
+    # Start with eval mode for all models.
     model.eval()
     ema.eval()
     vae.eval()
 
+    # Load discriminator checkpoint if provided
+    if args.disc_pretrained_ckpt is not None:
+        disc_ckpt = torch.load(args.disc_pretrained_ckpt, map_location='cpu')
+        vae_loss_fn.discriminator.load_state_dict(disc_ckpt)
+
+        if accelerator.is_main_process:
+            run_logger.info(f'Loaded discriminator from {args.disc_pretrained_ckpt}')
+
     global_step = 0
 
+    # Resume all model and optimizer states; this overrides pretrained initialization.
     if args.resume_step > 0:
         if args.continue_train_exp_dir is None:
             raise ValueError('--continue-train-exp-dir is required when --resume-step > 0.')
@@ -460,14 +450,17 @@ def main(args):
 
         global_step = ckpt['steps']
 
+    # Allow larger cache size for DYNAMo compilation
     torch._dynamo.config.cache_size_limit = 64
     torch._dynamo.config.accumulated_cache_size_limit = 512
 
+    # Model compile for better performance.
     if args.compile:
         model = torch.compile(model, backend='inductor', mode='default')
         vae = torch.compile(vae, backend='inductor', mode='default')
         vae_loss_fn = torch.compile(vae_loss_fn, backend='inductor', mode='default')
 
+    # Prepare models, optimizers and dataloaders for distributed/mixed-precision training.
     model, vae, vae_loss_fn, optimizer, optimizer_vae, optimizer_loss_fn, train_dataloader, val_dataloader = accelerator.prepare(
         model,
         vae,
@@ -490,129 +483,158 @@ def main(args):
         range(0, args.max_train_steps),
         initial=global_step,
         desc='Steps',
+        # Only show the progress bar on the main process.
         disable=not accelerator.is_local_main_process,
     )
 
-    local_sample_count = max(1, math.ceil(args.num_sample_images / accelerator.num_processes))
-
-    sample_batch = next(iter(val_dataloader))
-    sample_parents = batch_to_parents(sample_batch, device)
-
-    local_sample_count = min(local_sample_count, sample_parents['age'].shape[0])
-    sample_parents = slice_parents(sample_parents, local_sample_count)
-
-    sample_gen = torch.Generator(device=device)
-    sample_gen.manual_seed(args.sample_seed + accelerator.process_index)
-
-    xT = torch.randn(
-        (local_sample_count, in_channels, latent_size[0], latent_size[1]),
-        generator=sample_gen,
-        device=device,
+    # Prepare EMA sampling inputs for validation and sample generation
+    xT, sample_parents = prepare_ema_sampling_inputs(
+        val_dataloader, accelerator, args, in_channels, latent_size,
     )
 
+    # Main training loop: REPA-E jointly tunes the VAE and SiT (paper Sec. 3.2).
+    # REPA alignment updates both models in separate phases; diffusion loss updates SiT only.
     for epoch in range(args.epochs):
         for batch in train_dataloader:
             raw_image = batch['x'].to(device).repeat(1, 3, 1, 1) * 255.0
             parents = batch_to_parents(batch, device)
+            # Extract fixed pretrained features as targets for representation alignment.
             zs = extract_encoder_features(raw_image, encoders, encoder_types, architectures, accelerator)
 
             vae.train()
             model.train()
             vae_loss_fn.train()
 
-            with accelerator.accumulate([model, vae, vae_loss_fn]), accelerator.autocast():
-                processed_image = preprocess_imgs_vae(raw_image)
-                posterior, z, recon_image = vae(processed_image)
+            # Accumulate gradients across microbatches; keep backward outside autocast.
+            with accelerator.accumulate(model, vae, vae_loss_fn):
+                # 1). Forward pass: VAE
+                with accelerator.autocast():
+                    # Normalize images to [-1, 1], encode/sample z, then decode the reconstruction.
+                    processed_image = preprocess_imgs_vae(raw_image)
+                    posterior, z, recon_image = vae(processed_image)
 
+                # 2). Backward pass: VAE, compute the VAE loss, backpropagate, and update the VAE;
+                #     then compute the discriminator loss and update the discriminator.
+                # loss_kwargs is used for the SiT forward function and reused for both VAE and SiT.
                 loss_kwargs = dict(
                     path_type=args.path_type,
                     prediction=args.prediction,
                     weighting=args.weighting,
                 )
 
+                # Record time_input and noises from VAE alignment to avoid sampling again for SiT.
                 time_input = None
                 noises = None
 
-                # VAE update
+                # Turn off grads for the SiT model (avoid REPA gradient on the SiT model).
                 requires_grad(model, False)
+                # Avoid BN stats being updated by the VAE.
                 model.eval()
 
-                vae_loss, vae_loss_dict = vae_loss_fn(
-                    processed_image,
-                    recon_image,
-                    posterior,
-                    global_step,
-                    'generator',
-                )
+                base_model = original_model(accelerator, model, args.compile)
+                base_loss_fn = original_model(accelerator, vae_loss_fn, args.compile)
 
-                vae_loss = vae_loss.mean()
-                loss_kwargs['align_only'] = True
+                with accelerator.autocast():
+                    # Frozen modules bypass DDP during the VAE-only backward.
+                    # Compute VAE regularization losses to preserve reconstruction quality.
+                    vae_loss, vae_loss_dict = base_loss_fn(
+                        processed_image,
+                        recon_image,
+                        posterior,
+                        global_step,
+                        'generator',
+                    )
 
-                vae_align_outputs = model(
-                    x=z,
-                    parents=parents,
-                    zs=zs,
-                    loss_kwargs=loss_kwargs,
-                    time_input=time_input,
-                    noises=noises,
-                )
+                    vae_loss = vae_loss.mean()
 
-                vae_loss = vae_loss + args.vae_align_proj_coeff * vae_align_outputs['proj_loss'].mean()
+                    # Compute the REPA alignment loss for VAE updates.
+                    # Gradients pass through frozen SiT into z and the VAE encoder.
+                    loss_kwargs['align_only'] = True
 
+                    vae_align_outputs = base_model(
+                        x=z,
+                        parents=parents,
+                        zs=zs,
+                        loss_kwargs=loss_kwargs,
+                        time_input=time_input,
+                        noises=noises,
+                    )
+
+                    # VAE objective: L_REG + vae_align_proj_coeff * L_REPA.
+                    vae_loss = vae_loss + args.vae_align_proj_coeff * vae_align_outputs['proj_loss'].mean()
+
+                # Save time_input and noises and reuse them for the SiT model forward pass.
                 time_input = vae_align_outputs['time_input']
                 noises = vae_align_outputs['noises']
 
                 accelerator.backward(vae_loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm_vae = accelerator.clip_grad_norm_(vae.parameters(), args.max_grad_norm)
+                    # Unscale this optimizer only; REPA-E updates three optimizers.
+                    accelerator.unscale_gradients(optimizer=optimizer_vae)
+                    grad_norm_vae = torch.nn.utils.clip_grad_norm_(vae.parameters(), args.max_grad_norm)
 
                 optimizer_vae.step()
                 optimizer_vae.zero_grad(set_to_none=True)
 
-                # Discriminator update
-                d_loss, d_loss_dict = vae_loss_fn(
-                    processed_image,
-                    recon_image,
-                    posterior,
-                    global_step,
-                    'discriminator',
-                )
+                # Discriminator loss and update (continuation of step 2).
+                # The loss module detaches reconstructed images, so this does not update the VAE.
+                requires_grad(base_loss_fn.discriminator, True)
+                with accelerator.autocast():
+                    d_loss, d_loss_dict = vae_loss_fn(
+                        processed_image,
+                        recon_image,
+                        posterior,
+                        global_step,
+                        'discriminator',
+                    )
 
-                d_loss = d_loss.mean()
+                    d_loss = d_loss.mean()
+
                 accelerator.backward(d_loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm_disc = accelerator.clip_grad_norm_(vae_loss_fn.parameters(), args.max_grad_norm)
+                    accelerator.unscale_gradients(optimizer=optimizer_loss_fn)
+                    grad_norm_disc = torch.nn.utils.clip_grad_norm_(vae_loss_fn.parameters(), args.max_grad_norm)
 
                 optimizer_loss_fn.step()
                 optimizer_loss_fn.zero_grad(set_to_none=True)
 
-                # SiT update
+                # Turn the grads back on for the SiT model, and put the model into training mode.
                 requires_grad(model, True)
                 model.train()
 
+                # 3). Forward pass: SiT
+                # Avoid diffusion loss backpropagating to the VAE, so detach z below.
+                # Reuse the same time_input and noises sampled during VAE alignment.
                 loss_kwargs['align_only'] = False
 
-                sit_outputs = model(
-                    x=z.detach(),
-                    parents=parents,
-                    zs=zs,
-                    loss_kwargs=loss_kwargs,
-                    time_input=time_input,
-                    noises=noises,
-                )
+                with accelerator.autocast():
+                    sit_outputs = model(
+                        x=z.detach(),
+                        parents=parents,
+                        zs=zs,
+                        loss_kwargs=loss_kwargs,
+                        time_input=time_input,
+                        noises=noises,
+                    )
 
-                sit_loss = sit_outputs['denoising_loss'].mean() + args.proj_coeff * sit_outputs['proj_loss'].mean()
+                    # 4). Compute diffusion loss and REPA alignment loss, backpropagate the SiT loss,
+                    #     and update the model. Backward and optimizer steps stay outside autocast.
+                    # SiT objective: L_DIFF + proj_coeff * L_REPA.
+                    sit_loss = sit_outputs['denoising_loss'].mean() + args.proj_coeff * sit_outputs['proj_loss'].mean()
 
                 accelerator.backward(sit_loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm_sit = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    accelerator.unscale_gradients(optimizer=optimizer)
+                    grad_norm_sit = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
+                # 5). Update SiT EMA
+                # Update the moving average once per synchronized training update.
                 if accelerator.sync_gradients:
                     update_ema(ema, original_model(accelerator, model, args.compile))
 
@@ -620,6 +642,7 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                # Gather training metrics across processes for logging.
                 logs = {
                     'train/sit_loss': accelerator.gather(sit_loss).mean().detach().item(),
                     'train/denoising_loss': accelerator.gather(sit_outputs['denoising_loss']).mean().detach().item(),
@@ -645,6 +668,7 @@ def main(args):
 
                 accelerator.log(logs, step=global_step)
 
+                # Save unwrapped weights and all three optimizer states for later resume.
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                     base_model = original_model(accelerator, model, args.compile)
                     base_vae = original_model(accelerator, vae, args.compile)
@@ -667,6 +691,7 @@ def main(args):
 
                     run_logger.info(f'Saved checkpoint to {checkpoint_path}')
 
+                # Evaluate losses and save VAE/flow reconstructions and counterfactuals.
                 if global_step == 1 or global_step % args.validation_steps == 0:
                     val_logs = validate_repae(
                         model,
@@ -681,27 +706,30 @@ def main(args):
 
                     accelerator.log(val_logs, step=global_step)
 
-                    recon_grid = make_reconstruction_grid(
-                        vae,
-                        val_dataloader,
-                        accelerator,
-                        args,
-                    )
+                    base_vae = original_model(accelerator, vae, args.compile)
+                    vae_recon_grid = make_reconstruction_grid(base_vae, val_dataloader, accelerator, args)
+                    flow_recon_grid = make_flow_reconstruction_grid(ema, base_vae, val_dataloader, accelerator, args)
+                    counterfactual_grid = make_counterfactual_grid(ema, base_vae, val_dataloader, accelerator, args)
 
                     if accelerator.is_main_process:
                         append_jsonl(validation_path, {'step': global_step, **val_logs})
-
-                        recon_path = os.path.join(recon_dir, f'recon_step_{global_step:07d}.png')
-                        Image.fromarray(recon_grid).save(recon_path)
-
-                        accelerator.log(
-                            {'reconstructions/vae': wandb.Image(recon_grid)},
-                            step=global_step,
-                        )
-
+                        vae_recon_path = os.path.join(recon_dir, f'vae_recon_step_{global_step:07d}.png')
+                        recon_path = os.path.join(recon_dir, f'flow_recon_step_{global_step:07d}.png')
+                        counterfactual_path = os.path.join(counterfactual_dir, f'counterfactual_step_{global_step:07d}.png')
+                        Image.fromarray(vae_recon_grid).save(vae_recon_path)
+                        Image.fromarray(flow_recon_grid).save(recon_path)
+                        Image.fromarray(counterfactual_grid).save(counterfactual_path)
+                        accelerator.log({
+                            'reconstructions/vae': wandb.Image(vae_recon_grid),
+                            'reconstructions/flow_inversion': wandb.Image(flow_recon_grid),
+                            'counterfactuals/flow_inversion': wandb.Image(counterfactual_grid),
+                        }, step=global_step)
                         run_logger.info(f'Validation step {global_step}: {val_logs}')
-                        run_logger.info(f'Saved VAE reconstructions to {recon_path}')
+                        run_logger.info(f'Saved VAE reconstructions to {vae_recon_path}')
+                        run_logger.info(f'Saved flow inversion reconstructions to {recon_path}')
+                        run_logger.info(f'Saved counterfactuals to {counterfactual_path}')
 
+                # Generate samples with EMA SiT and decode them using the current trained VAE.
                 if global_step == 1 or global_step % args.sampling_steps == 0:
                     out_samples = generate_ema_samples(
                         ema,
@@ -753,6 +781,9 @@ def parse_args(input_args=None):
     parser.add_argument('--validation-batches', type=int, default=16)
     parser.add_argument('--num-sample-images', type=int, default=16)
     parser.add_argument('--num-recon-images', type=int, default=8)
+    parser.add_argument('--reconstruction-num-steps', type=int, default=50)
+    parser.add_argument('--num-counterfactual-images', type=int, default=4)
+    parser.add_argument('--counterfactual-num-steps', type=int, default=50)
     parser.add_argument('--sample-seed', type=int, default=1234)
     parser.add_argument('--sample-num-steps', type=int, default=50)
     parser.add_argument('--sample-cfg-scale', type=float, default=4.0)
