@@ -536,7 +536,7 @@ def main(args):
                 )
                 raise FloatingPointError(reason)
 
-            with accelerator.accumulate(model), accelerator.autocast():
+            with accelerator.accumulate(model):
                 model.train()
                 base_model = original_model(accelerator, model, args.compile)
                 base_model.bn.eval()
@@ -546,21 +546,23 @@ def main(args):
                 # the same stochastic training example without modifying models/sit.py.
                 forward_rng_state = capture_rng_state(device)
 
-                sit_outputs = model(
-                    x=z,
-                    parents=parents,
-                    zs=zs,
-                    loss_kwargs=dict(
-                        weighting=args.weighting,
-                        path_type=args.path_type,
-                        prediction=args.prediction,
-                        align_only=False,
-                    ),
-                )
+                # Keep backward and optimizer updates outside autocast.
+                with accelerator.autocast():
+                    sit_outputs = model(
+                        x=z,
+                        parents=parents,
+                        zs=zs,
+                        loss_kwargs=dict(
+                            weighting=args.weighting,
+                            path_type=args.path_type,
+                            prediction=args.prediction,
+                            align_only=False,
+                        ),
+                    )
 
-                denoising_loss = sit_outputs['denoising_loss'].mean()
-                proj_loss = sit_outputs['proj_loss'].mean()
-                sit_loss = denoising_loss + args.proj_coeff * proj_loss if use_repa else denoising_loss
+                    denoising_loss = sit_outputs['denoising_loss'].mean()
+                    proj_loss = sit_outputs['proj_loss'].mean()
+                    sit_loss = denoising_loss + args.proj_coeff * proj_loss if use_repa else denoising_loss
                 losses = {
                     'sit_loss': sit_loss.detach().float().item(),
                     'denoising_loss': denoising_loss.detach().float().item(),

@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 from data_handle.embed import DatasetConfig, get_embed
 from models.autoencoder import vae_models
-from models.sit_labelembed import SiT_models
+from models.sit import SiT_models
 from plot_utils import (
     array2grid,
     generate_ema_samples,
@@ -123,17 +123,13 @@ def capture_rng_state(device):
 def collect_bad_gradients(model):
     bad_grad_stats = []
     bad_grad_tensors = {}
-
     for name, p in model.named_parameters():
         if p.grad is None:
             continue
-
         grad = p.grad.detach()
         finite_mask = torch.isfinite(grad)
-
         if finite_mask.all():
             continue
-
         finite = grad[finite_mask]
         bad_grad_stats.append({
             'name': name,
@@ -146,7 +142,6 @@ def collect_bad_gradients(model):
             'numel': grad.numel(),
         })
         bad_grad_tensors[name] = grad.cpu()
-
     return bad_grad_stats, bad_grad_tensors
 
 
@@ -178,7 +173,6 @@ def save_failure_snapshot(
         'bad_grad_stats': bad_grad_stats or [],
         'bad_grad_tensors': bad_grad_tensors or {},
     }
-
     rank_path = os.path.join(step_dir, f'rank_{rank}.pt')
     torch.save(rank_snapshot, rank_path)
     print(f'[rank{rank}] Saved failure inputs to {rank_path}', flush=True)
@@ -206,9 +200,9 @@ def batch_to_parents(batch, device):
     pa = batch['pa']
     return {
         'age': pa['age'].float().to(device),
-        'view': pa['view'].to(device),
-        'density': pa['density'].to(device),
-        'scanner': pa['scanner'].to(device),
+        'view': pa['view'].float().to(device),
+        'density': pa['density'].float().to(device),
+        'scanner': pa['scanner'].float().to(device),
     }
 
 
@@ -361,7 +355,6 @@ def main(args):
     requires_grad(ema, False)
 
     stats_path = Path(args.vae_ckpt).parent / f'embed_{args.vae}_{args.height}x{args.width}_latent_stats.pt'
-
     if not stats_path.exists():
         raise FileNotFoundError(
             f'Latent statistics not found: {stats_path}\n'
@@ -369,7 +362,6 @@ def main(args):
         )
 
     latents_stats = torch.load(stats_path, map_location='cpu')
-
     if 'mean' not in latents_stats or 'std' not in latents_stats:
         raise KeyError(f'Latent statistics file must contain mean and std: {stats_path}')
 
@@ -488,12 +480,11 @@ def main(args):
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
-
         if lr_scheduler is not None and ckpt.get('scheduler') is not None:
             lr_scheduler.load_state_dict(ckpt['scheduler'])
-
         global_step = ckpt['steps']
 
+        # Keep latent normalization tied to the current dataset/resolution stats.
         model.init_bn(latents_bias=latents_bias, latents_scale=latents_scale)
         ema.init_bn(latents_bias=latents_bias, latents_scale=latents_scale)
 
@@ -550,6 +541,9 @@ def main(args):
                 base_model = original_model(accelerator, model, args.compile)
                 base_model.bn.eval()
 
+                # Save the exact RNG state immediately before SiT forward. The flow model samples
+                # t/noise internally, so restoring this state with the saved z/parents reproduces
+                # the same stochastic training example without modifying models/sit.py.
                 forward_rng_state = capture_rng_state(device)
 
                 sit_outputs = model(
@@ -567,7 +561,6 @@ def main(args):
                 denoising_loss = sit_outputs['denoising_loss'].mean()
                 proj_loss = sit_outputs['proj_loss'].mean()
                 sit_loss = denoising_loss + args.proj_coeff * proj_loss if use_repa else denoising_loss
-
                 losses = {
                     'sit_loss': sit_loss.detach().float().item(),
                     'denoising_loss': denoising_loss.detach().float().item(),
@@ -590,7 +583,6 @@ def main(args):
 
                 base_model = original_model(accelerator, model, args.compile)
                 bad_grad_stats, bad_grad_tensors = collect_bad_gradients(base_model)
-
                 if bad_grad_stats:
                     first = bad_grad_stats[0]
                     reason = (
@@ -598,10 +590,8 @@ def main(args):
                         f'first={first["name"]}, shape={first["shape"]}, finite_absmax={first["finite_absmax"]}, '
                         f'nan={first["num_nan"]}, +inf={first["num_posinf"]}, -inf={first["num_neginf"]}'
                     )
-
                     for item in bad_grad_stats:
                         print(f'[rank{accelerator.process_index}] bad_grad: {item}', flush=True)
-
                     save_failure_snapshot(
                         accelerator, model, ema, optimizer, lr_scheduler, args, failure_dir, global_step,
                         reason=reason, z=z, parents=parents, zs=zs, raw_image=raw_image, batch=batch,
@@ -685,21 +675,33 @@ def main(args):
                     accelerator.log(val_logs, step=global_step)
 
                     flow_recon_grid = make_flow_reconstruction_grid(
-                        ema, vae, val_dataloader, accelerator, args
+                        ema,
+                        vae,
+                        val_dataloader,
+                        accelerator,
+                        args,
                     )
 
                     counterfactual_grid = make_counterfactual_grid(
-                        ema, vae, val_dataloader, accelerator, args
+                        ema,
+                        vae,
+                        val_dataloader,
+                        accelerator,
+                        args,
                     )
 
                     if accelerator.is_main_process:
                         append_jsonl(validation_path, {'step': global_step, **val_logs})
 
-                        recon_path = os.path.join(recon_dir, f'flow_recon_step_{global_step:07d}.png')
+                        recon_path = os.path.join(
+                            recon_dir,
+                            f'flow_recon_step_{global_step:07d}.png',
+                        )
                         Image.fromarray(flow_recon_grid).save(recon_path)
 
                         counterfactual_path = os.path.join(
-                            counterfactual_dir, f'counterfactual_step_{global_step:07d}.png'
+                            counterfactual_dir,
+                            f'counterfactual_step_{global_step:07d}.png',
                         )
                         Image.fromarray(counterfactual_grid).save(counterfactual_path)
 
@@ -717,14 +719,19 @@ def main(args):
 
                 if global_step == 1 or global_step % args.sampling_steps == 0:
                     out_samples = generate_ema_samples(
-                        ema, vae, xT, sample_parents, in_channels, accelerator, args
+                        ema,
+                        vae,
+                        xT,
+                        sample_parents,
+                        in_channels,
+                        accelerator,
+                        args,
                     )
 
                     if accelerator.is_main_process:
                         out_samples = out_samples[:args.num_sample_images]
                         grid = array2grid(out_samples)
                         sample_path = os.path.join(sample_dir, f'ema_step_{global_step:07d}.png')
-
                         Image.fromarray(grid).save(sample_path)
                         accelerator.log({'samples/ema': wandb.Image(grid)}, step=global_step)
                         run_logger.info(f'Saved EMA samples to {sample_path}')
@@ -750,7 +757,6 @@ def parse_args(input_args=None):
     parser.add_argument('--exp-name', type=str, required=True)
     parser.add_argument('--logging-dir', type=str, default='logs')
     parser.add_argument('--report-to', type=str, default='wandb')
-
     parser.add_argument('--sampling-steps', type=int, default=5000)
     parser.add_argument('--validation-steps', type=int, default=5000)
     parser.add_argument('--validation-batches', type=int, default=16)
@@ -762,7 +768,6 @@ def parse_args(input_args=None):
     parser.add_argument('--sample-seed', type=int, default=1234)
     parser.add_argument('--sample-num-steps', type=int, default=50)
     parser.add_argument('--sample-cfg-scale', type=float, default=1.0)
-
     parser.add_argument('--resume-step', type=int, default=0)
     parser.add_argument('--continue-train-exp-dir', type=str, default=None)
 
@@ -785,7 +790,6 @@ def parse_args(input_args=None):
     parser.add_argument('--max-train-steps', type=int, default=400000)
     parser.add_argument('--checkpointing-steps', type=int, default=5000)
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
-
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--lr-warmup-steps', type=int, default=2000)
     parser.add_argument('--adam-beta1', type=float, default=0.9)
@@ -793,7 +797,6 @@ def parse_args(input_args=None):
     parser.add_argument('--adam-weight-decay', type=float, default=0.)
     parser.add_argument('--adam-epsilon', type=float, default=1e-8)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
-
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num-workers', type=int, default=8)
 
