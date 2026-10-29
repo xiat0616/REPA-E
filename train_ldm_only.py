@@ -396,11 +396,12 @@ def main(args):
     global_step = 0
 
     # Restore trainable/EMA weights, optimizer state, step and optional warmup state.
-    if args.resume_step > 0:
+    if args.resume_current or args.resume_step > 0:
         if args.continue_train_exp_dir is None:
-            raise ValueError('--continue-train-exp-dir is required when --resume-step > 0.')
+            raise ValueError('--continue-train-exp-dir is required when resuming training.')
 
-        ckpt_path = f'{args.continue_train_exp_dir}/checkpoints/{args.resume_step:07d}.pt'
+        ckpt_name = 'current.pt' if args.resume_current else f'{args.resume_step:07d}.pt'
+        ckpt_path = f'{args.continue_train_exp_dir}/checkpoints/{ckpt_name}'
         ckpt = torch.load(ckpt_path, map_location='cpu')
 
         model.load_state_dict(ckpt['model'])
@@ -531,8 +532,10 @@ def main(args):
 
                 accelerator.log(logs, step=global_step)
 
-                # Save unwrapped model/EMA weights and optimizer/scheduler state for resume.
-                if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
+                # Keep a rolling recovery checkpoint and less frequent numbered snapshots.
+                save_current = global_step % args.current_checkpointing_steps == 0
+                save_numbered = global_step % args.checkpointing_steps == 0
+                if (save_current or save_numbered) and accelerator.is_main_process:
                     base_model = original_model(accelerator, model, args.compile)
 
                     checkpoint = {
@@ -544,9 +547,21 @@ def main(args):
                         'steps': global_step,
                     }
 
-                    checkpoint_path = f'{checkpoint_dir}/{global_step:07d}.pt'
-                    torch.save(checkpoint, checkpoint_path)
-                    run_logger.info(f'Saved checkpoint to {checkpoint_path}')
+                    checkpoint_paths = []
+                    if save_current:
+                        checkpoint_paths.append(f'{checkpoint_dir}/current.pt')
+                    if save_numbered:
+                        checkpoint_paths.append(f'{checkpoint_dir}/{global_step:07d}.pt')
+
+                    for checkpoint_path in checkpoint_paths:
+                        temporary_path = f'{checkpoint_path}.tmp'
+                        try:
+                            torch.save(checkpoint, temporary_path)
+                            os.replace(temporary_path, checkpoint_path)
+                        finally:
+                            if os.path.exists(temporary_path):
+                                os.remove(temporary_path)
+                        run_logger.info(f'Saved checkpoint to {checkpoint_path}')
 
                 # Validate the objective and plot reconstructions/counterfactuals.
                 if global_step == 1 or global_step % args.validation_steps == 0:
@@ -659,6 +674,7 @@ def parse_args(input_args=None):
     parser.add_argument('--sample-num-steps', type=int, default=50)
     parser.add_argument('--sample-cfg-scale', type=float, default=1.0)
     parser.add_argument('--resume-step', type=int, default=0)
+    parser.add_argument('--resume-current', action='store_true', help='Resume checkpoints/current.pt.')
     parser.add_argument('--continue-train-exp-dir', type=str, default=None)
 
     parser.add_argument('--model', type=str, default='SiT-B/2', choices=SiT_models.keys())
@@ -679,7 +695,10 @@ def parse_args(input_args=None):
     parser.add_argument('--mixed-precision', type=str, default='bf16', choices=['no', 'fp16', 'bf16'])
     parser.add_argument('--epochs', type=int, default=1400)
     parser.add_argument('--max-train-steps', type=int, default=400000)
-    parser.add_argument('--checkpointing-steps', type=int, default=5000)
+    parser.add_argument('--current-checkpointing-steps', type=int, default=5000,
+                        help='Overwrite checkpoints/current.pt every N optimizer updates.')
+    parser.add_argument('--checkpointing-steps', type=int, default=50000,
+                        help='Keep a numbered checkpoint every N optimizer updates.')
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--lr-warmup-steps', type=int, default=2000)
@@ -701,7 +720,12 @@ def parse_args(input_args=None):
     parser.add_argument('--vae', type=str, default='f8d4', choices=['f8d4', 'f16d32'])
     parser.add_argument('--vae-ckpt', type=str, default='pretrained/sdvae-f8d4/sdvae-f8d4.pt')
 
-    return parser.parse_args(input_args) if input_args is not None else parser.parse_args()
+    args = parser.parse_args(input_args)
+    if min(args.current_checkpointing_steps, args.checkpointing_steps) < 1:
+        parser.error('Checkpoint intervals must be positive.')
+    if args.resume_current and args.resume_step > 0:
+        parser.error('Choose --resume-current or --resume-step, not both.')
+    return args
 
 
 if __name__ == '__main__':
