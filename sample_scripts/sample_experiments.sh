@@ -102,6 +102,7 @@ ARGS=(
     --num-workers=$num_workers
     --seed=$seed
     --cfg-scale=$cfg_scale
+    --save-visuals
 
     --tasks generation reconstruction counterfactual
     --attributes view density scanner age
@@ -122,26 +123,21 @@ if [ "$dry_run" = true ]; then
     exit 0
 fi
 
-submission_name="step_${checkpoint_name}_$(date +%Y%m%d_%H%M%S)_$$"
-log_dir="${output_dir}/logs/${submission_name}"
-mkdir -p "$log_dir"
-printf 'method\tjob_id\timages\n' > "${log_dir}/jobs.tsv"
-
 # These calls submit immediately; the three sampling jobs are independent.
-ldm_job=$(SAMPLE_LOG_DIR="$log_dir" bash "${project_root}/sample_scripts/sample_all.sh" \
+ldm_job=$(bash "${project_root}/sample_scripts/sample_checkpoint.sh" \
     "$partition" "$ldm_ckpt" "${ARGS[@]}" --output-dir="$ldm_samples")
-printf 'ldm\t%s\t%s\n' "$ldm_job" "$ldm_samples" >> "${log_dir}/jobs.tsv"
+printf 'method\tjob_id\timages\nldm\t%s\t%s\n' "$ldm_job" "$ldm_samples" > "${ldm_samples}/logs/jobs.tsv"
 
-repa_job=$(SAMPLE_LOG_DIR="$log_dir" bash "${project_root}/sample_scripts/sample_all.sh" \
+repa_job=$(bash "${project_root}/sample_scripts/sample_checkpoint.sh" \
     "$partition" "$repa_ckpt" "${ARGS[@]}" --output-dir="$repa_samples")
-printf 'repa\t%s\t%s\n' "$repa_job" "$repa_samples" >> "${log_dir}/jobs.tsv"
+printf 'method\tjob_id\timages\nrepa\t%s\t%s\n' "$repa_job" "$repa_samples" > "${repa_samples}/logs/jobs.tsv"
 
-repae_job=$(SAMPLE_LOG_DIR="$log_dir" bash "${project_root}/sample_scripts/sample_all.sh" \
+repae_job=$(bash "${project_root}/sample_scripts/sample_checkpoint.sh" \
     "$partition" "$repae_ckpt" "${ARGS[@]}" --output-dir="$repae_samples")
-printf 'repae\t%s\t%s\n' "$repae_job" "$repae_samples" >> "${log_dir}/jobs.tsv"
+printf 'method\tjob_id\timages\nrepae\t%s\t%s\n' "$repae_job" "$repae_samples" > "${repae_samples}/logs/jobs.tsv"
 
 echo "Submitted sampling jobs"
 echo "  LDM          = $ldm_job"
 echo "  REPA         = $repa_job"
 echo "  REPA-E       = $repae_job"
-echo "  job records  = ${log_dir}/jobs.tsv"
+echo "  job records are saved in each experiment's logs/jobs.tsv"

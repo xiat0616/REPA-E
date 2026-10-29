@@ -3,7 +3,7 @@ r"""Evaluate saved images without loading the diffusion model, VAE or raw datase
     .venv/bin/python evaluation/evaluate_all.py \
         --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
 
-Sampling is a separate step, performed by sample_all.py. This evaluator reads the
+Sampling is a separate step, performed by sample_checkpoint.py. This evaluator reads the
 completed samples.csv and its 16-bit grayscale PNGs. It checks each image checksum
 and uses fixed [0,1] scaling; it never rescales an image by its own intensity range.
 The saved-image protocol includes uint16 quantization for both references and
@@ -227,7 +227,9 @@ def main(args):
     output_root = Path(args.output_root).expanduser().resolve()
     run_label = f"{sample_config['split']}_n{len(indices)}_seed{seed}_steps{sample_config['arguments'].get('num_steps', 50)}_{sample_config['weights']}"
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else output_root / experiment / f'step_{step_label}' / run_label
-    if output_dir.exists():
+    # Slurm creates logs before Python starts; existing metrics are never reused.
+    if output_dir.exists() and (not (output_dir / 'logs').is_dir()
+            or any(path.name != 'logs' for path in output_dir.iterdir())):
         raise FileExistsError(f'Results already exist: {output_dir}. Choose another --output-dir.')
     if output_dir == samples_dir or samples_dir in output_dir.parents:
         raise ValueError('Write metrics outside the immutable sampling cache.')
@@ -299,7 +301,8 @@ def main(args):
     signature['arguments'] = {key: value for key, value in arguments.items()
                               if key not in ('output_root', 'output_dir', 'samples_dir', 'save_examples')}
     metadata['evaluation_id'] = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / '.evaluation_started').touch(exist_ok=False)
     (output_dir / 'indices.json').write_text(json.dumps(selection, indent=2) + '\n')
     (output_dir / 'config.json').write_text(json.dumps(metadata, indent=2, allow_nan=False) + '\n')
     identity_rows, eligible_counts = [], {attribute: 0 for attribute in args.attributes}

@@ -6,14 +6,14 @@ images go to `sample_results/`. Metric code remains in `evaluation/`.
 From `/vol/biomedic3/tx1215/REPA-E`:
 
 ```bash
-bash sample_scripts/sample_all.sh gpus48 \
+bash sample_scripts/sample_checkpoint.sh gpus48 \
   checkpoints/EXPERIMENT/checkpoints/0065000.pt
 ```
 
 Or run Python inside an allocation:
 
 ```bash
-.venv/bin/python sample/sample_all.py \
+.venv/bin/python sample/sample_checkpoint.py \
   --checkpoint checkpoints/EXPERIMENT/checkpoints/0065000.pt
 ```
 
@@ -27,6 +27,9 @@ sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema/
   indices.json
   samples.csv
   COMPLETE
+  logs/sample_checkpoint.JOB_ID.log
+  logs/sample_checkpoint.JOB_ID.out
+  logs/jobs.tsv
   real/00000123.png
   generation/00000123.png
   reconstruction/vae/00000123.png
@@ -35,6 +38,28 @@ sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema/
   counterfactual/density/00000123.png
   counterfactual/scanner/00000123.png
   counterfactual/age/00000123.png
+  counterfactual_visuals/view/00000123.png
+  counterfactual_visuals/density/00000123.png
+  counterfactual_visuals/scanner/00000123.png
+  counterfactual_visuals/age/00000123.png
+```
+
+Each eligible counterfactual also gets a horizontal visual panel: **original |
+counterfactual | difference map**. The images are grayscale with a fixed [0,1]
+display range. The difference map uses the existing `RdBu_r` colors and symmetric
+limits around zero for `(counterfactual - original) * 255`: red is an increase,
+blue is a decrease. A horizontal colorbar shows the scale for each panel. The
+middle title includes the intervened attribute and its source/target values.
+
+Panels are rendered from the saved 16-bit PNGs. They are RGB previews, stored
+separately from `samples.csv`, and do not enter evaluation. They are enabled by
+default; add `--no-save-visuals` to the single-checkpoint sampling command to skip
+them. To add or regenerate panels in an existing completed cache without loading
+a checkpoint or resampling:
+
+```bash
+.venv/bin/python sample/visualize_counterfactuals.py \
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
 ```
 
 `sample_io.py` defines the portable image/manifest format shared with evaluation.
@@ -53,6 +78,11 @@ the same saved-image protocol.
 Existing export directories are preserved. To rerun an incomplete export, use a
 new `--output-dir`. Completed folders can be moved without their checkpoint or
 raw dataset because all images and metadata needed for evaluation are included.
+
+Slurm logs and the captured Python output are saved inside each sampling run's
+own `logs/` folder. Three-baseline submissions also record that experiment's
+job ID in `logs/jobs.tsv`. Python accepts the log-only folder created at
+submission and refuses to overwrite existing sample data.
 
 For three baselines, edit settings in `sample_scripts/sample_experiments.sh`:
 

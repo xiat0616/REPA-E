@@ -28,7 +28,9 @@ bash sample_scripts/sample_experiments.sh gpus48 65000
 This submits three independent one-GPU sampling jobs. Images and metadata are
 saved in `sample_results/`; no metric or report jobs are submitted. Omit the step
 or use `latest-common` to sample the latest step shared by all three experiments.
-Sampling job IDs are recorded under `sample_results/logs/`.
+Each experiment's logs and job ID are saved in its own sampling folder, under
+`logs/` (`sample_checkpoint.JOB_ID.log`, `sample_checkpoint.JOB_ID.out`, and
+`jobs.tsv`).
 
 After sampling completes, evaluate the saved images:
 
@@ -79,6 +81,11 @@ Individual results remain under `evaluation/results/` for standalone runs.
 Comparison launches use `evaluation/comparisons/step_TIMESTAMP_PID/`, containing
 individual metric results, logs, `jobs.tsv`, `report.md`, combined CSVs, and
 PNG/PDF figures. `COMPARISON_DIR` selects an exact new comparison destination.
+
+Each metric run stores its Slurm and Python logs in its own `logs/` folder. For
+a comparison these are `evaluations/ldm/logs/`, `evaluations/repa/logs/`, and
+`evaluations/repae/logs/`. The shared report job's log stays in the comparison's
+`logs/` folder.
 
 Reports verify shared split indices, identical saved real images, image precision,
 sampling settings, metric settings, and feature-model fingerprints. To summarize

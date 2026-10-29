@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 r"""Sample and export a checkpoint once; evaluate the saved PNGs separately.
 
-    python sample/sample_all.py --checkpoint checkpoints/RUN/checkpoints/0065000.pt
+    python sample/sample_checkpoint.py --checkpoint checkpoints/RUN/checkpoints/0065000.pt
 
 Outputs are fixed-scale 16-bit grayscale PNGs, samples.csv, indices.json and
-config.json. No metric feature models are loaded by this command.
+config.json, plus original / counterfactual / difference panels for inspection.
+No metric feature models are loaded by this command.
 """
 import argparse
 import hashlib
@@ -189,9 +190,12 @@ def _sample(args):
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else (
         output_root / experiment / f'step_{step_label}' /
         f'{args.split}_n{args.num_samples}_seed{args.seed}_steps{args.num_steps}_{args.weights}')
-    if output_dir.exists():
+    # Slurm creates logs before Python starts; existing samples are never reused.
+    if output_dir.exists() and (not (output_dir / 'logs').is_dir()
+            or any(path.name != 'logs' for path in output_dir.iterdir())):
         raise FileExistsError(f'Sample cache already exists: {output_dir}. Choose another --output-dir.')
-    source_files = ['sample/sample_all.py', 'sample/sample_io.py', 'plot_utils.py', 'samplers.py',
+    source_files = ['sample/sample_checkpoint.py', 'sample/sample_io.py',
+                    'sample/visualize_counterfactuals.py', 'plot_utils.py', 'samplers.py',
                     'models/sit.py', 'models/embedder.py', 'models/autoencoder.py', 'data_handle/embed.py', 'utils.py']
     metadata = {
         'status': 'running', 'checkpoint': str(checkpoint_path), 'step': step, 'experiment': experiment,
@@ -205,7 +209,9 @@ def _sample(args):
         'inference': 'FP32, TF32 off, posterior mode, selected saved BN; CF/cycle CFG1; generation requested CFG/Heun',
         'sampling_source_sha256': {name: sha256_file(ROOT / name) for name in source_files},
     }
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Claim a log-only folder exclusively, including when two jobs start together.
+    (output_dir / '.sampling_started').touch(exist_ok=False)
     save_json(output_dir / 'indices.json', selection)
     save_json(output_dir / 'config.json', metadata)
     records = []
@@ -274,6 +280,10 @@ def _sample(args):
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise RuntimeError('Checkpoint changed while sampling; this cache will not be marked complete.')
         write_records(output_dir, records)
+        metadata['num_counterfactual_visuals'] = 0
+        if args.save_visuals and 'counterfactual' in args.tasks:
+            from sample.visualize_counterfactuals import save_counterfactual_visuals
+            metadata['num_counterfactual_visuals'] = save_counterfactual_visuals(output_dir, records)
         metadata['eligible_interventions'] = eligible_counts
         metadata['reference_images_sha256'] = reference_images_hash(records)
         metadata['num_saved_images'] = len(records)
@@ -321,6 +331,8 @@ def parse_args(argv=None):
     parser.add_argument('--target-density', type=int, choices=range(4), default=None)
     parser.add_argument('--target-scanner', type=int, choices=range(5), default=None)
     parser.add_argument('--target-age', type=float, default=None)
+    parser.add_argument('--save-visuals', action=argparse.BooleanOptionalAction, default=True,
+                        help='Save original / counterfactual / difference panels (default: enabled).')
     parser.add_argument('--output-root', default=str(ROOT / 'sample_results'))
     parser.add_argument('--output-dir', default=None)
     args = parser.parse_args(argv)

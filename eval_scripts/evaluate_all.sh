@@ -8,7 +8,6 @@ samples_dir="${2:-}"
 project_root="/vol/biomedic3/tx1215/REPA-E"
 uv_bin="/vol/biomedic2/tx1215/uv/bin/uv"
 output_root="${project_root}/evaluation/results"
-log_dir="${EVAL_LOG_DIR:-${output_root}/logs}"
 
 # These settings affect metrics only; sampling settings are loaded from the cache.
 batch_size=4
@@ -64,20 +63,65 @@ if [ $# -gt 2 ]; then
     ARGS+=("${@:3}")
 fi
 
-mkdir -p "$log_dir"
+# Match logs to the final metric output directory, including caller overrides.
+save_dir=""
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    option="${ARGS[i]%%=*}"
+    case "$option" in
+        --output-dir|--output-root)
+            if [[ "${ARGS[i]}" = *=* ]]; then
+                value="${ARGS[i]#*=}"
+            else
+                i=$((i + 1))
+                value="${ARGS[i]:-}"
+            fi
+            if [ -z "$value" ]; then
+                echo "Missing value for $option." >&2
+                exit 1
+            fi
+            case "$option" in
+                --output-dir) save_dir="$value" ;;
+                --output-root) output_root="$value" ;;
+            esac
+            ;;
+    esac
+done
+
+if [ -z "$save_dir" ]; then
+    exp_name="$(basename "$(dirname "$(dirname "$samples_dir")")")"
+    step_name="$(basename "$(dirname "$samples_dir")")"
+    sample_name="$(basename "$samples_dir")"
+    save_dir="${output_root}/${exp_name}/${step_name}/${sample_name}"
+fi
+if [ "${save_dir:0:1}" != "/" ]; then
+    save_dir="${project_root}/${save_dir}"
+fi
+ARGS+=(--output-dir="$save_dir")
+log_dir="${save_dir}/logs"
+
+mkdir -p "$(dirname "$save_dir")"
+if ! mkdir "$save_dir"; then
+    echo "Results already exist: $save_dir. Choose another --output-dir." >&2
+    exit 1
+fi
+mkdir "$log_dir"
+
 echo "Saved-image evaluation" >&2
 echo "  samples    = $samples_dir" >&2
 echo "  partition  = $partition" >&2
+echo "  results    = $save_dir" >&2
 echo "  logs       = $log_dir" >&2
 
 printf -v EVAL_ARGS '%q ' "${ARGS[@]}"
+printf -v SLURM_LOG '%q' "${log_dir}/evaluate_all.%j.log"
+printf -v PYTHON_LOG_PREFIX '%q' "${log_dir}/evaluate_all."
 
 if [ "$partition" = "gpus48" ]; then
     submission=$(sbatch "${SUBMIT_ARGS[@]}" <<EOF
 #!/bin/bash
 #SBATCH --partition=gpus48
 #SBATCH --gres=gpu:1
-#SBATCH --output="${log_dir}/evaluate_all.%j.log"
+#SBATCH --output=${SLURM_LOG}
 
 source ~/.bashrc
 unset LD_LIBRARY_PATH
@@ -89,7 +133,7 @@ export TQDM_MININTERVAL=300
 
 nvidia-smi
 
-srun "${uv_bin}" run --no-sync python -u evaluation/evaluate_all.py ${EVAL_ARGS} 2>&1 | tee -a "${log_dir}/evaluate_all.\$SLURM_JOB_ID.out"
+srun "${uv_bin}" run --no-sync python -u evaluation/evaluate_all.py ${EVAL_ARGS} 2>&1 | tee -a ${PYTHON_LOG_PREFIX}"\$SLURM_JOB_ID.out"
 EOF
 )
 
@@ -98,7 +142,7 @@ elif [ "$partition" = "gpus24" ]; then
 #!/bin/bash
 #SBATCH --partition=gpus24
 #SBATCH --gres=gpu:1
-#SBATCH --output="${log_dir}/evaluate_all.%j.log"
+#SBATCH --output=${SLURM_LOG}
 
 source ~/.bashrc
 unset LD_LIBRARY_PATH
@@ -110,7 +154,7 @@ export TQDM_MININTERVAL=300
 
 nvidia-smi
 
-srun "${uv_bin}" run --no-sync python -u evaluation/evaluate_all.py ${EVAL_ARGS} 2>&1 | tee -a "${log_dir}/evaluate_all.\$SLURM_JOB_ID.out"
+srun "${uv_bin}" run --no-sync python -u evaluation/evaluate_all.py ${EVAL_ARGS} 2>&1 | tee -a ${PYTHON_LOG_PREFIX}"\$SLURM_JOB_ID.out"
 EOF
 )
 fi
