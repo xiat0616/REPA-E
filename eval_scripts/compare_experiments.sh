@@ -18,7 +18,7 @@ repae_exp="embed_repae_sits2_256x192"
 # These settings identify the saved-image folders; no sampling is performed.
 weights="ema"
 split="test"
-num_samples=5000
+num_samples=500
 num_steps=50
 seed=1234
 
