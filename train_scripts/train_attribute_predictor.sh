@@ -48,13 +48,17 @@ export TORCH_HOME="${project_root}/cache/torch"
 export OMP_NUM_THREADS=2
 if [ "$partition" = local ]; then
     cd "$project_root"
-    "$python_bin" -u evaluation/train_attribute_predictor.py "${ARGS[@]}" 2>&1 | tee "$output_dir/logs/train.out"
+    {
+        printf 'Predictor process starting at '; date -u
+        printf 'Host: '; hostname
+        "$python_bin" -u evaluation/train_attribute_predictor.py "${ARGS[@]}"
+    } 2>&1 | tee "$output_dir/logs/train.out"
 else
     printf -v command_line '%q ' "$python_bin" -u "${project_root}/evaluation/train_attribute_predictor.py" "${ARGS[@]}"
     printf -v root_quoted '%q' "$project_root"
     job_id=$(sbatch --parsable --partition="$partition" --gres=gpu:1 \
         --job-name=attribute_predictor --output="$output_dir/logs/train.%j.log" \
-        --wrap="cd ${root_quoted} && ${command_line}")
+        --wrap="set -eu; cd ${root_quoted}; printf 'Predictor job starting at '; date -u; printf 'Host: '; hostname; exec ${command_line}")
     printf '%s\n' "$job_id" > "$output_dir/logs/job_id.txt"
     printf 'Submitted predictor job: %s\n' "$job_id"
 fi

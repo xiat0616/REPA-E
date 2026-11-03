@@ -98,6 +98,30 @@ Each run requires a new output directory; logs are kept inside that directory.
 The default run is
 `checkpoints/attribute_predictor/resnet50_256x192_seed1234/`.
 
+Training logs include immediate process startup, split-check stages, model
+initialization, epoch/batch progress, validation results, and best-checkpoint
+updates. Progress is flushed every 30 seconds by default; adjust it with
+`--log-interval-seconds`. Image-path checks can take time on the shared filesystem
+and report their own progress before `run.json` is created. Slurm logs begin
+when the job starts running. Code changes apply to future launches; a running
+Python process keeps its already loaded code.
+
+Logs use readable timestamped messages. During training, Slurm logs show lines
+such as:
+
+```text
+[22:45:00 UTC] Epoch 1/20 | Batch 120/3715 (3.2%) | loss=1.2345 | mean_loss=1.4567 | elapsed 00:02:00 | epoch ETA 00:59:54 | 64.0 img/s
+```
+
+`loss` is the current batch loss; `mean_loss` is the running mean for that epoch.
+ETA estimates the remaining training time in the current epoch, excluding
+validation. Lines are printed after the first and last batches, and every
+`--log-interval-seconds` in between (default 30 seconds). Interactive terminals
+show a tqdm bar instead, refreshed about once per second. `--no-progress-bar`
+uses the same readable batch lines in terminals. Dataset checks, validation,
+and checkpoint updates also use short readable messages. Full configuration,
+confusion matrices, baselines and history remain in `run.json`/`history.json`.
+
 The predictor uses an ImageNet-initialized ResNet-50, separate heads for view
 (2 classes), density (4), scanner (5), and continuous age. It consumes only
 images; it never receives conditioning attributes as inputs. Real-image reads
