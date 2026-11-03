@@ -270,6 +270,87 @@ def _quality_table(rows, methods, specs):
     return "\n".join(tables)
 
 
+def _effectiveness_table(rows, methods, attributes):
+    categorical, age = [], []
+    for attribute in attributes:
+        for method in methods:
+            def metric(comparison, name):
+                return _find(rows, method, "effectiveness", comparison, attribute, name, "all")
+            primary = metric("cf_target", "target_mae_years" if attribute == "age" else "target_accuracy")
+            if primary is None:
+                continue
+            count = primary.get("n_generated") or primary.get("n_real") or "0"
+            if attribute == "age":
+                age.append([method, count, _format(_score(primary)),
+                            _format(_score(metric("cf_target", "target_rmse_years"))),
+                            _format(_score(metric("cf_target", "target_within_tolerance"))),
+                            _format(_score(metric("input_target", "target_mae_years"))), _support(primary)])
+            else:
+                categorical.append([attribute.title(), method, count, _format(_score(primary)),
+                                    _format(_score(metric("cf_target", "balanced_target_accuracy"))),
+                                    _format(_score(metric("input_target", "target_accuracy"))), _support(primary)])
+    return ("### Categorical interventions\n\n" + _table(
+        ["Attribute", "Method", "Images", "Target accuracy ↑", "Balanced target accuracy ↑", "Input target accuracy", "Support"], categorical)
+        + "\n### Age interventions\n\n" + _table(
+        ["Method", "Images", "Target MAE (years) ↓", "Target RMSE (years) ↓", "Within tolerance ↑", "Input target MAE (years)", "Support"], age))
+
+
+def _predictor_diagnostics(rows, methods, predictor):
+    heldout = predictor.get("test_metrics", {})
+    heldout_rows = []
+    for attribute in ATTRIBUTES:
+        metrics = heldout.get(attribute, {})
+        heldout_rows.append([attribute.title(), heldout.get("n", "—"),
+                             _format(metrics.get("accuracy")), _format(metrics.get("balanced_accuracy")),
+                             _format(metrics.get("macro_f1")), _format(metrics.get("mae_years")),
+                             _format(metrics.get("rmse_years"))])
+    cached_rows = []
+    for attribute in ATTRIBUTES:
+        for method in methods:
+            names = ("mae_years", "rmse_years") if attribute == "age" else ("accuracy", "balanced_accuracy")
+            selected = [_find(rows, method, "effectiveness", "real_prediction", attribute, metric, "all")
+                        for metric in names]
+            if not any(selected):
+                continue
+            count = next((row.get("n_real") or row.get("n_generated") or "0" for row in selected if row), "0")
+            for metric, row in zip(names, selected):
+                if row:
+                    cached_rows.append([attribute.title(), method, count, metric, _format(_score(row)), _support(row)])
+    return ("### Predictor quality on held-out real test patients\n\n"
+            "The shared predictor checkpoint records the following held-out test performance after validation-based checkpoint selection. "
+            "These results qualify the measurement model; they are not counterfactual effectiveness scores.\n\n"
+            + _table(["Attribute", "Images", "Accuracy ↑", "Balanced accuracy ↑", "Macro F1 ↑", "MAE (years) ↓", "RMSE (years) ↓"], heldout_rows)
+            + "\n### Predictor diagnostics on the cached factual images\n\n"
+            "These diagnostics use the same cached factual cohort as the counterfactuals. They describe predictor behavior on that cohort "
+            "and do not replace its held-out test evaluation.\n\n"
+            + _table(["Attribute", "Method", "Images", "Metric", "Value", "Support"], cached_rows))
+
+
+def _effectiveness_figure(output_dir, rows, methods, attributes, synthetic=False):
+    categorical = [attribute for attribute in attributes if attribute != "age"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.8))
+    for ax, selected, metric, title in (
+            (axes[0], categorical, "target_accuracy", "Categorical target accuracy ↑"),
+            (axes[1], ["age"] if "age" in attributes else [], "target_mae_years", "Age target MAE (years) ↓")):
+        values = {method: [_score(_find(rows, method, "effectiveness", "cf_target", attribute, metric, "all"))
+                           for attribute in selected] or [None] for method in methods}
+        _grouped_bars(ax, [attribute.title() for attribute in selected] or ["No requested edits"], values, methods, title)
+        ax.set_title(title, loc="left", fontweight="bold")
+        if metric == "target_accuracy":
+            ax.set_ylim(0, 1.2)
+    fig.suptitle("Counterfactual effectiveness", fontsize=16, fontweight="bold", y=.99)
+    fig.legend([Patch(color=COLORS[method]) for method in methods], methods,
+               loc="upper center", bbox_to_anchor=(.5, .94), ncol=len(methods), frameon=False)
+    if synthetic:
+        fig.text(.5, .865, "SYNTHETIC PREVIEW — NOT BENCHMARK RESULTS", ha="center",
+                 fontsize=10, color="#9B2626", fontweight="bold")
+    fig.text(.5, .02, "Predicted requested attribute versus intervention target, across all eligible counterfactuals.\n"
+             "Scores depend on predictor quality. Panels use separate units; no combined score is calculated.",
+             ha="center", fontsize=9, color="#444444")
+    fig.tight_layout(rect=(0, .10, 1, .85), w_pad=3)
+    return _save_figure(fig, output_dir, "counterfactual_effectiveness")
+
+
 def build_report(output_dir: Path, runs: dict, protocol: dict) -> list[Path]:
     """Write tables and PNG/PDF figures; return every produced artifact path.
 
@@ -282,12 +363,19 @@ def build_report(output_dir: Path, runs: dict, protocol: dict) -> list[Path]:
     if not methods:
         raise ValueError("At least one recognized method is required.")
     rows = _load_rows(runs)
+    effectiveness = any(row.get("family") == "effectiveness" for row in rows)
     attributes = _attributes(rows, protocol)
     combined = output_dir / "metrics.csv"
     targets_path = output_dir / "counterfactual_targets.csv"
     _write_csv(combined, rows)
     target_rows = [row for row in rows if row.get("comparison") == "counterfactual_target"]
     _write_csv(targets_path, target_rows)
+    effectiveness_paths = []
+    if effectiveness:
+        effectiveness_paths = [output_dir / "effectiveness_targets.csv"]
+        _write_csv(effectiveness_paths[0], [row for row in rows if row.get("family") == "effectiveness"
+                                          and row.get("comparison") in ("cf_target", "input_target")
+                                          and row.get("target") != "all"])
     specs = _quality_specs(rows, attributes)
     with plt.rc_context({"font.family": "DejaVu Sans", "font.size": 10,
                          "axes.labelsize": 10, "axes.titlesize": 12,
@@ -298,6 +386,9 @@ def build_report(output_dir: Path, runs: dict, protocol: dict) -> list[Path]:
                                              synthetic=bool(protocol.get("synthetic_preview"))))
         figures.extend(_quality_figure(output_dir, rows, methods, specs,
                                       synthetic=bool(protocol.get("synthetic_preview"))))
+        if effectiveness:
+            figures.extend(_effectiveness_figure(output_dir, rows, methods, attributes,
+                                                 synthetic=bool(protocol.get("synthetic_preview"))))
     settings = protocol.get("settings", {})
     experiment_rows = []
     cohort_rows = []
@@ -361,10 +452,37 @@ def build_report(output_dir: Path, runs: dict, protocol: dict) -> list[Path]:
              "not confidence intervals. The reported metrics should be interpreted alongside intervention effectiveness and example images. "
              "DINOv2 is also the REPA training teacher, so the Inception and similarity results provide additional perspectives.", ""]
     report_path = output_dir / "report.md"
+    if effectiveness:
+        predictor = protocol.get("attribute_predictor", {})
+        tolerance = settings.get("age_tolerance_years", "recorded in config.json")
+        section = ["## Counterfactual effectiveness", "",
+                   "A shared frozen attribute predictor scores each requested edit against its target. Categorical target accuracy "
+                   "is the fraction whose predicted category equals the requested category. Age is evaluated in years; lower target "
+                   "MAE/RMSE and a higher within-tolerance fraction indicate greater effectiveness. "
+                   f"The age tolerance is **{tolerance} years**. All eligible interventions are scored, including those whose factual prediction is incorrect.", "",
+                   "The input-target columns apply the same predictor to the unchanged factual image against the intervention target. "
+                   "They expose how often an unchanged image already appears to satisfy the request. They are diagnostics, not effectiveness gains. "
+                   "Balanced target accuracy averages recall across supported target categories. Rates are fractions in [0, 1]. "
+                   "No combined score mixes categorical rates with age error.", "",
+                   _effectiveness_table(rows, methods, attributes),
+                   "![Counterfactual effectiveness](figures/counterfactual_effectiveness.png)", "",
+                   _table(["Predictor setting", "Value"], [
+                       ["Checkpoint SHA256", predictor.get("checkpoint_sha256", "—")],
+                       ["Backbone", predictor.get("backbone", "—")],
+                       ["Resolution", predictor.get("resolution", "—")],
+                       ["Selected epoch", predictor.get("selected_epoch", "—")],
+                   ]), _predictor_diagnostics(rows, methods, predictor), "",
+                   "[Effectiveness target groups (CSV)](effectiveness_targets.csv) records scores and support for each requested target. "
+                   "Predictor errors and distribution shift on generated images can affect these estimates; inspect them with image examples and the existing metrics.", ""]
+        position = lines.index("## Distribution quality")
+        lines[position:position] = section
+        position = lines.index("- [All metric rows (CSV)](metrics.csv)") + 1
+        lines[position:position] = ["- [Effectiveness target groups (CSV)](effectiveness_targets.csv)",
+                                    "- [Counterfactual effectiveness (PDF)](figures/counterfactual_effectiveness.pdf)"]
     if protocol.get("synthetic_preview"):
         lines[2:2] = ["> **SYNTHETIC PREVIEW — NOT BENCHMARK RESULTS.** All values are artificial test fixtures.", ""]
     report_path.write_text("\n".join(lines))
-    return [report_path, combined, targets_path, *figures]
+    return [report_path, combined, targets_path, *effectiveness_paths, *figures]
 
 
 PROTOCOL_ARGUMENTS = (
@@ -387,9 +505,33 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _predictor_protocol(config, rows, method):
+    requested = "effectiveness" in config["arguments"]["evaluations"]
+    recorded = any(row["family"] == "effectiveness" for row in rows)
+    if requested != recorded:
+        raise ValueError(f"{method}: effectiveness rows do not match the requested evaluations")
+    if not requested:
+        return None
+    predictor = config.get("attribute_predictor")
+    if not isinstance(predictor, dict):
+        raise ValueError(f"{method}: effectiveness requires attribute_predictor metadata")
+    for key in ("checkpoint_sha256", "state_dict_sha256"):
+        digest = predictor.get(key)
+        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError(f"{method}: attribute_predictor has an invalid {key}")
+    tolerance = _number(config["arguments"].get("age_tolerance_years"))
+    if tolerance is None or tolerance <= 0:
+        raise ValueError(f"{method}: effectiveness requires a positive age_tolerance_years")
+    # Equivalent checkpoint files may be mounted at different paths. Fingerprints,
+    # preprocessing and recorded predictor quality establish comparability.
+    identity = {key: value for key, value in predictor.items()
+                if key not in ("path", "checkpoint", "checkpoint_path")}
+    return {"predictor": identity, "age_tolerance_years": tolerance}
+
+
 def validate_results(runs):
     """Validate completed, comparable result files before writing a report."""
-    configs, selections, fingerprints = {}, {}, {}
+    configs, selections, fingerprints, predictors = {}, {}, {}, {}
     for method in METHODS:
         directory = Path(runs[method]).expanduser().resolve()
         for filename in ("config.json", "indices.json", "summary.csv"):
@@ -438,6 +580,7 @@ def validate_results(runs):
                 if key in row and key in config and str(row[key]) != str(config[key]):
                     raise ValueError(f"{method}: summary.csv {key} does not match config.json")
         configs[method], selections[method] = config, selection
+        predictors[method] = _predictor_protocol(config, rows, method)
         fingerprints[method] = {filename: _sha256(directory / filename)
                                 for filename in ("config.json", "indices.json", "summary.csv")}
     reference = configs["LDM"]
@@ -450,6 +593,8 @@ def validate_results(runs):
         for key in PROTOCOL_ARGUMENTS:
             if configs[method]["arguments"][key] != reference["arguments"][key]:
                 raise ValueError(f"{method}: evaluation setting {key} differs from LDM")
+        if predictors[method] != predictors["LDM"]:
+            raise ValueError(f"{method}: attribute predictor or age tolerance differs from LDM")
     protocol = {
         "step": reference["step"], "settings": reference["arguments"],
         "experiments": {method: {"name": config["experiment"], "checkpoint": config["checkpoint"]}
@@ -461,6 +606,8 @@ def validate_results(runs):
         "sampling_source_sha256": reference["sampling_source_sha256"],
         "reference_images_sha256": reference["reference_images_sha256"],
     }
+    if predictors["LDM"] is not None:
+        protocol["attribute_predictor"] = predictors["LDM"]["predictor"]
     return protocol, selections["LDM"], fingerprints
 
 

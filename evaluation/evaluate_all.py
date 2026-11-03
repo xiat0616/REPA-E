@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT / 'evaluation'))
 from identity_metrics import IdentityMetrics, write_summaries
 from feature_metrics import DinoFeatures, InceptionFeatures, group_label, sha256_file, update_groups
 from frechet_metrics import FeatureMoments, frechet_distance
+from effectiveness_metrics import EffectivenessMetrics
 from sample.sample_io import load_samples, read_image
 
 ATTRIBUTES = ('view', 'density', 'scanner', 'age')
@@ -202,8 +203,18 @@ def main(args):
     sample_config, selection, records = load_samples(samples_dir)
     args.tasks, args.attributes = resolve_tasks(args, sample_config, records)
     identity_enabled = 'identity' in args.evaluations
+    effectiveness_enabled = 'effectiveness' in args.evaluations
     if identity_enabled and not set(args.tasks) & {'reconstruction', 'counterfactual'}:
         raise ValueError('Identity metrics require reconstruction or counterfactual tasks.')
+    if effectiveness_enabled:
+        if 'counterfactual' not in args.tasks:
+            raise ValueError('Effectiveness requires cached counterfactual tasks.')
+        if not args.attribute_predictor:
+            raise ValueError('Effectiveness requires --attribute-predictor PATH to a trained, held-out evaluated checkpoint.')
+    elif args.attribute_predictor:
+        raise ValueError('Add effectiveness to --evaluations when supplying --attribute-predictor.')
+    if not np.isfinite(args.age_tolerance_years) or args.age_tolerance_years <= 0:
+        raise ValueError('--age-tolerance-years must be finite and positive.')
     indices = selection['indices']
     if len(indices) < (2 if set(args.evaluations) & {'inception', 'dino'} else 1):
         raise ValueError('Distribution evaluation requires at least two cached images.')
@@ -214,6 +225,17 @@ def main(args):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     device = torch.device(args.device)
+    predictor, predictor_metadata, effectiveness = None, None, None
+    if effectiveness_enabled:
+        from attribute_predictor import load_predictor
+        predictor, predictor_metadata = load_predictor(args.attribute_predictor, device)
+        if sample_config['split'] != 'test':
+            raise ValueError('Effectiveness must use the predictor\'s held-out test split, never its train/valid images.')
+        if sample_config['split_csv_sha256'] != predictor_metadata['split_csv_sha256']['test']:
+            raise ValueError('Sampling cache test-split hash differs from the predictor\'s held-out split.')
+        if list(sample_config['resolution']) != list(predictor_metadata['resolution']):
+            raise ValueError('Sampling cache resolution differs from predictor training preprocessing.')
+        effectiveness = EffectivenessMetrics(args.attributes, args.age_tolerance_years)
     dataset = SavedImages(samples_dir, sample_config, selection, records, args.tasks,
                           args.attributes, identity_enabled or args.save_examples > 0)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
@@ -234,7 +256,7 @@ def main(args):
     if output_dir == samples_dir or samples_dir in output_dir.parents:
         raise ValueError('Write metrics outside the immutable sampling cache.')
 
-    # Feature models are metric dependencies only. No checkpoint/raw-data paths are opened.
+    # Only requested metric models are loaded; generative checkpoints/raw data are never opened.
     inception_name = 'weights-inception-2015-12-05-6726825d.pth'
     candidates = [Path(torch.hub.get_dir()) / 'checkpoints' / inception_name,
                   ROOT / 'cache/torch/hub/checkpoints' / inception_name,
@@ -294,8 +316,17 @@ def main(args):
                   'DINOv2 is also the REPA teacher; compare with Inception and identity scores.'],
         'source_sha256': {name: sha256_file(ROOT / name) for name in [
             'evaluation/evaluate_all.py', 'evaluation/identity_metrics.py', 'evaluation/feature_metrics.py',
-            'evaluation/frechet_metrics.py', 'sample/sample_io.py', 'loss/lpips.py'] if (ROOT / name).is_file()},
+            'evaluation/frechet_metrics.py', 'sample/sample_io.py', 'loss/lpips.py',
+            *(['evaluation/attribute_predictor.py', 'evaluation/effectiveness_metrics.py']
+              if effectiveness_enabled else [])] if (ROOT / name).is_file()},
     })
+    if effectiveness_enabled:
+        metadata['attribute_predictor'] = predictor_metadata
+        metadata['notes'].append(
+            'Effectiveness compares predicted edited attributes with requested targets on all eligible CFs. '
+            'Categorical target accuracy is higher-is-better; age target errors are in years and lower-is-better. '
+            'Input-target scores are no-edit diagnostics. Inspect the predictor held-out performance; '
+            'prediction agreement is an imperfect proxy for edit success.')
     signature = dict(metadata)
     signature.pop('status')
     signature['arguments'] = {key: value for key, value in arguments.items()
@@ -311,6 +342,10 @@ def main(args):
     for items in tqdm(loader, desc='Evaluating saved images'):
         original = stack_images(items, ('real', 'none'), device)
         factual_rows = [item['records'][('real', 'none')] for item in items]
+        factual_predictions = None
+        if effectiveness_enabled:
+            factual_predictions = predictor(original)
+            effectiveness.update_real(factual_predictions, factual_rows, [item['index'] for item in items])
         for name, extractor in extractors.items():
             features = extractor(original)
             statistics[name]['real'].update(features)
@@ -347,6 +382,11 @@ def main(args):
             chosen = [items[i] for i in positions]
             cf_rows = [item['records'][('counterfactual', attribute)] for item in chosen]
             cf = stack_images(chosen, ('counterfactual', attribute), device)
+            if effectiveness_enabled:
+                effectiveness.update_counterfactual(
+                    attribute, predictor(cf),
+                    {name: values[positions] for name, values in factual_predictions.items()},
+                    cf_rows, [item['index'] for item in chosen])
             for name, extractor in extractors.items():
                 update_groups(statistics[name]['counterfactual'], extractor(cf),
                               parent_values(cf_rows, attribute, device), attribute, args)
@@ -376,6 +416,18 @@ def main(args):
     common = {key: metadata[key] for key in ('evaluation_id', 'experiment', 'step', 'checkpoint', 'weights', 'split', 'num_images')}
     common.update(seed=seed, num_steps=arguments['num_steps'], results_dir=str(output_dir))
     combined_rows = []
+    if effectiveness_enabled:
+        folder = output_dir / 'effectiveness'
+        folder.mkdir()
+        rows = effectiveness.summaries()
+        write_csv(folder / 'per_sample.csv', effectiveness.per_sample)
+        write_csv(folder / 'summary.csv', rows)
+        (folder / 'summary.json').write_text(json.dumps({
+            'metadata': metadata, 'age_tolerance_years': args.age_tolerance_years,
+            'metrics': rows}, indent=2, allow_nan=False) + '\n')
+        for row in rows:
+            combined_rows.append(dict(common, family='effectiveness', **row,
+                                      low_sample_count='', rank_deficient=''))
     if identity_enabled:
         folder = output_dir / 'identity'
         folder.mkdir()
@@ -412,7 +464,9 @@ def main(args):
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--samples-dir', required=True)
-    parser.add_argument('--evaluations', nargs='+', choices=['identity', 'inception', 'dino'], default=['identity', 'inception', 'dino'])
+    parser.add_argument('--evaluations', nargs='+', choices=['identity', 'inception', 'dino', 'effectiveness'], default=['identity', 'inception', 'dino'])
+    parser.add_argument('--attribute-predictor', default=None, help='Completed real-image predictor checkpoint; required for effectiveness.')
+    parser.add_argument('--age-tolerance-years', type=float, default=5., help='Age target success tolerance in years; MAE/RMSE are also always reported.')
     parser.add_argument('--identity-metrics', nargs='+', choices=['mae', 'mse', 'ssim', 'lpips'], default=['mae', 'mse', 'ssim', 'lpips'])
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=None, help='Subset of cached tasks; default evaluates all cached tasks.')
     parser.add_argument('--attributes', nargs='+', choices=ATTRIBUTES, default=None, help='Subset of cached CF attributes; default uses all cached attributes.')

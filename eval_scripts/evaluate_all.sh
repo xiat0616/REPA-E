@@ -58,6 +58,11 @@ ARGS=(
     --identity-metrics mae mse ssim lpips
     --feature-model="$feature_model"
 )
+if [ -n "${ATTRIBUTE_PREDICTOR:-}" ]; then
+    ARGS+=(--evaluations identity inception dino effectiveness
+           --attribute-predictor="$ATTRIBUTE_PREDICTOR"
+           --age-tolerance-years="${AGE_TOLERANCE_YEARS:-5}")
+fi
 
 if [ $# -gt 2 ]; then
     ARGS+=("${@:3}")

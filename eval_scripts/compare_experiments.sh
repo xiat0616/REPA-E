@@ -27,6 +27,9 @@ batch_size=4
 num_workers=0
 feature_model="dinov2_vitb14"
 save_examples=0
+# Set after training/validating a predictor; the same checkpoint scores all methods.
+attribute_predictor="${ATTRIBUTE_PREDICTOR:-}"
+age_tolerance_years="${AGE_TOLERANCE_YEARS:-5}"
 
 dry_run=false
 if [ "${3:-}" = "--dry-run" ]; then
@@ -90,6 +93,18 @@ EVAL_ARGS=(
     --identity-metrics mae mse ssim lpips
     --feature-model="$feature_model"
 )
+if [ -n "$attribute_predictor" ]; then
+    if [ "${attribute_predictor:0:1}" != "/" ]; then
+        attribute_predictor="${project_root}/${attribute_predictor}"
+    fi
+    if [ ! -f "$attribute_predictor" ]; then
+        echo "Attribute predictor checkpoint not found: $attribute_predictor" >&2
+        exit 1
+    fi
+    EVAL_ARGS+=(--evaluations identity inception dino effectiveness
+                --attribute-predictor="$attribute_predictor"
+                --age-tolerance-years="$age_tolerance_years")
+fi
 
 SUMMARY_ARGS=(
     --ldm-results="$ldm_results"

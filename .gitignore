@@ -192,3 +192,6 @@ evaluate256.py
 cache/
 checkpoints/
 debug/
+
+# Counterfactual predictor launcher
+!train_scripts/train_attribute_predictor.sh
