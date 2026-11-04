@@ -58,7 +58,7 @@ cluster. Evaluate only completed caches containing a `COMPLETE` marker.
 ## One saved-image run
 
 ```bash
-bash eval_scripts/evaluate_all.sh gpus48 \
+bash eval_scripts/evaluate_checkpoint.sh gpus48 \
   sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
 ```
 

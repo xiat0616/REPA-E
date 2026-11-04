@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Usage: bash eval_scripts/evaluate_all.sh [gpus48|gpus24] SAMPLES_DIR [metric options]
+# Usage: bash eval_scripts/evaluate_checkpoint.sh [gpus48|gpus24] SAMPLES_DIR [metric options]
 partition="${1:-gpus48}"
 samples_dir="${2:-}"
 
@@ -126,8 +126,8 @@ echo "  results    = $save_dir" >&2
 echo "  logs       = $log_dir" >&2
 
 printf -v EVAL_ARGS '%q ' "${ARGS[@]}"
-printf -v SLURM_LOG '%q' "${log_dir}/evaluate_all.%j.log"
-printf -v PYTHON_LOG_PREFIX '%q' "${log_dir}/evaluate_all."
+printf -v SLURM_LOG '%q' "${log_dir}/evaluate_checkpoint.%j.log"
+printf -v PYTHON_LOG_PREFIX '%q' "${log_dir}/evaluate_checkpoint."
 
 if [ "$partition" = "gpus48" ]; then
     submission=$(sbatch "${SUBMIT_ARGS[@]}" <<EOF

@@ -131,17 +131,17 @@ printf 'stage\tmethod\tjob_id\toutput\n' > "${save_dir}/jobs.tsv"
 
 # Evaluate the three saved-image folders independently.
 ldm_eval_job=$(EVAL_DEPENDENCY="" \
-    bash "${project_root}/eval_scripts/evaluate_all.sh" "$partition" "$ldm_samples" \
+    bash "${project_root}/eval_scripts/evaluate_checkpoint.sh" "$partition" "$ldm_samples" \
     "${EVAL_ARGS[@]}" --output-dir="$ldm_results")
 printf 'evaluate\tldm\t%s\t%s\n' "$ldm_eval_job" "$ldm_results" >> "${save_dir}/jobs.tsv"
 
 repa_eval_job=$(EVAL_DEPENDENCY="" \
-    bash "${project_root}/eval_scripts/evaluate_all.sh" "$partition" "$repa_samples" \
+    bash "${project_root}/eval_scripts/evaluate_checkpoint.sh" "$partition" "$repa_samples" \
     "${EVAL_ARGS[@]}" --output-dir="$repa_results")
 printf 'evaluate\trepa\t%s\t%s\n' "$repa_eval_job" "$repa_results" >> "${save_dir}/jobs.tsv"
 
 repae_eval_job=$(EVAL_DEPENDENCY="" \
-    bash "${project_root}/eval_scripts/evaluate_all.sh" "$partition" "$repae_samples" \
+    bash "${project_root}/eval_scripts/evaluate_checkpoint.sh" "$partition" "$repae_samples" \
     "${EVAL_ARGS[@]}" --output-dir="$repae_results")
 printf 'evaluate\trepae\t%s\t%s\n' "$repae_eval_job" "$repae_results" >> "${save_dir}/jobs.tsv"
 
