@@ -128,7 +128,7 @@ class SavedEffectivenessTest(unittest.TestCase):
                      and row['attribute'] == 'view' and row['target'] == 'all'
                      and row['metric'] == 'target_accuracy')
         self.assertEqual((float(score['value']), int(score['n_generated'])), (1., 2))
-        self.assertTrue(output.name.endswith('_uniform'))
+        self.assertEqual(output.name, 'test_n2_seed1_steps50_ema')
         metadata = json.loads((output / 'config.json').read_text())
         self.assertEqual(metadata['counterfactual_targets_sha256'], self.config['counterfactual_targets_sha256'])
 

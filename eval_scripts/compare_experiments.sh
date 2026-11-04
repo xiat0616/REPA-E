@@ -21,7 +21,7 @@ split="test"
 num_samples=1000
 num_steps=50
 seed=1234
-sample_suffix="${SAMPLE_SUFFIX-_uniform}"
+sample_suffix="${SAMPLE_SUFFIX-}"
 
 # Metric settings.
 batch_size=4

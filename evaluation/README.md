@@ -17,9 +17,10 @@ VAE, or raw dataset. Recomputing metrics never generates images again.
 
 New sampling runs draw categorical targets uniformly from all classes, including
 the source class; age targets are uniform within the training split's age range.
-These caches have an `_uniform` suffix, selected by the comparison launcher by
-default. To evaluate older cyclic-target caches, set `SAMPLE_SUFFIX=""` when
-calling `compare_experiments.sh`. New and old policies should be reported separately.
+Default cache names end in `_ema` (or `_model`), and the target policy is recorded
+in `config.json`. To evaluate an earlier suffixed cache, set
+`SAMPLE_SUFFIX="_uniform"` when calling `compare_experiments.sh`, or pass its path
+to the single-cache evaluator. New and old policies should be reported separately.
 
 ## Three-baseline workflow
 
@@ -58,14 +59,14 @@ cluster. Evaluate only completed caches containing a `COMPLETE` marker.
 
 ```bash
 bash eval_scripts/evaluate_all.sh gpus48 \
-  sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform
+  sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
 ```
 
 Direct Python, inside an allocation:
 
 ```bash
 .venv/bin/python evaluation/evaluate_all.py \
-  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform \
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema \
   --evaluations identity --identity-metrics mae mse ssim \
   --output-dir evaluation/results/my_identity_evaluation
 ```
@@ -168,7 +169,7 @@ After training and reviewing the held-out results, evaluate saved test images:
 
 ```bash
 .venv/bin/python evaluation/evaluate_all.py \
-  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n1000_seed1234_steps50_ema_uniform \
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n1000_seed1234_steps50_ema \
   --evaluations identity inception dino effectiveness \
   --attribute-predictor checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt \
   --age-tolerance-years 5 \

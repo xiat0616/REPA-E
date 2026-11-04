@@ -37,7 +37,7 @@ The training age bounds, training-CSV checksum, policy and actual target-assignm
 checksum are recorded in `config.json`.
 
 ```text
-sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform/
+sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema/
   config.json
   indices.json
   samples.csv
@@ -74,7 +74,7 @@ a checkpoint or resampling:
 
 ```bash
 .venv/bin/python sample/visualize_counterfactuals.py \
-  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
 ```
 
 `sample_io.py` defines the portable image/manifest format shared with evaluation.
@@ -94,9 +94,11 @@ the same saved-image protocol.
 Existing export directories are preserved. To rerun an incomplete export, use a
 new `--output-dir`. Completed folders can be moved without their checkpoint or
 raw dataset because all images and metadata needed for evaluation are included.
-New default folders end in `_uniform`, keeping them separate from previous cyclic
-exports. Sampling and comparison launchers use this suffix by default. Set
-`SAMPLE_SUFFIX=""` on the comparison launcher to evaluate older unsuffixed caches.
+Default folders use the original names ending in `_ema` (or `_model`). The
+uniform target policy and assignments are recorded in `config.json`, independent
+of the folder name. Existing exports must still use a new output directory when
+resampling. To address an earlier suffixed cache through the comparison launcher,
+set `SAMPLE_SUFFIX="_uniform"` explicitly, or pass its path to the single-cache evaluator.
 
 Slurm logs and the captured Python output are saved inside each sampling run's
 own `logs/` folder. Three-baseline submissions also record that experiment's

@@ -17,7 +17,7 @@ batch_size=4
 num_workers=0
 seed=1234
 cfg_scale=1.0
-sample_suffix="${SAMPLE_SUFFIX-_uniform}"
+sample_suffix="${SAMPLE_SUFFIX-}"
 
 if [ "$partition" != "gpus48" ] && [ "$partition" != "gpus24" ]; then
     echo "Unknown partition: $partition. Use gpus48 or gpus24." >&2

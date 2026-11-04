@@ -202,7 +202,7 @@ def _sample(args):
     output_root = Path(args.output_root).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else (
         output_root / experiment / f'step_{step_label}' /
-        f'{args.split}_n{args.num_samples}_seed{args.seed}_steps{args.num_steps}_{args.weights}_uniform')
+        f'{args.split}_n{args.num_samples}_seed{args.seed}_steps{args.num_steps}_{args.weights}')
     # Slurm creates logs before Python starts; existing samples are never reused.
     if output_dir.exists() and (not (output_dir / 'logs').is_dir()
             or any(path.name != 'logs' for path in output_dir.iterdir())):

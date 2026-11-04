@@ -24,7 +24,7 @@ batch_size=4
 num_workers=0
 seed=1234
 cfg_scale=1.0
-sample_suffix="${SAMPLE_SUFFIX-_uniform}"
+sample_suffix="${SAMPLE_SUFFIX-}"
 
 dry_run=false
 if [ "${3:-}" = "--dry-run" ]; then

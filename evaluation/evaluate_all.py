@@ -248,8 +248,6 @@ def main(args):
         raise ValueError('Cached experiment must be a single folder name.')
     output_root = Path(args.output_root).expanduser().resolve()
     run_label = f"{sample_config['split']}_n{len(indices)}_seed{seed}_steps{sample_config['arguments'].get('num_steps', 50)}_{sample_config['weights']}"
-    if sample_config.get('counterfactual_target_policy') == 'uniform_v1':
-        run_label += '_uniform'
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else output_root / experiment / f'step_{step_label}' / run_label
     # Slurm creates logs before Python starts; existing metrics are never reused.
     if output_dir.exists() and (not (output_dir / 'logs').is_dir()
