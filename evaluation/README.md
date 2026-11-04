@@ -190,19 +190,22 @@ The run writes `effectiveness/per_sample.csv`, `effectiveness/summary.csv`, and
 `summary.csv`. Checkpoint and tensor fingerprints, preprocessing, split hashes,
 and held-out performance are retained in `config.json`.
 
-The Slurm launchers can enable effectiveness using the same checkpoint for all
-methods:
+The Slurm launchers enable effectiveness by default using
+`checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt` for all
+methods. Set `ATTRIBUTE_PREDICTOR` to use another checkpoint:
 
 ```bash
 ATTRIBUTE_PREDICTOR=checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt \
   bash eval_scripts/compare_experiments.sh gpus48 65000
 ```
 
-`AGE_TOLERANCE_YEARS` optionally overrides the default. The comparison report
+Set `ATTRIBUTE_PREDICTOR=""` to disable effectiveness, including when requesting
+a custom `--evaluations` subset that excludes it. `AGE_TOLERANCE_YEARS`
+optionally overrides the default. The comparison report
 adds effectiveness tables, categorical accuracy and age-error panels, factual
 diagnostics, and `effectiveness_targets.csv`. Comparisons reject differing
-predictor fingerprints or age tolerances. Without a predictor argument, the
-existing evaluation workflow stays available.
+predictor fingerprints or age tolerances. With an explicitly empty predictor,
+the existing identity, Inception and DINO evaluation workflow stays available.
 
 ## Results and reporting
 

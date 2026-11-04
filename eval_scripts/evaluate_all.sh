@@ -14,6 +14,8 @@ batch_size=4
 num_workers=0
 feature_model="dinov2_vitb14"
 save_examples=0
+# Use the trained predictor by default; set ATTRIBUTE_PREDICTOR="" to disable.
+attribute_predictor="${ATTRIBUTE_PREDICTOR-${project_root}/checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt}"
 
 if [ "$partition" != "gpus48" ] && [ "$partition" != "gpus24" ]; then
     echo "Unknown partition: $partition. Use gpus48 or gpus24." >&2
@@ -58,9 +60,16 @@ ARGS=(
     --identity-metrics mae mse ssim lpips
     --feature-model="$feature_model"
 )
-if [ -n "${ATTRIBUTE_PREDICTOR:-}" ]; then
+if [ -n "$attribute_predictor" ]; then
+    if [ "${attribute_predictor:0:1}" != "/" ]; then
+        attribute_predictor="${project_root}/${attribute_predictor}"
+    fi
+    if [ ! -f "$attribute_predictor" ]; then
+        echo "Attribute predictor checkpoint not found: $attribute_predictor" >&2
+        exit 1
+    fi
     ARGS+=(--evaluations identity inception dino effectiveness
-           --attribute-predictor="$ATTRIBUTE_PREDICTOR"
+           --attribute-predictor="$attribute_predictor"
            --age-tolerance-years="${AGE_TOLERANCE_YEARS:-5}")
 fi
 

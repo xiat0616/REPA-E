@@ -27,8 +27,8 @@ batch_size=4
 num_workers=0
 feature_model="dinov2_vitb14"
 save_examples=0
-# Set after training/validating a predictor; the same checkpoint scores all methods.
-attribute_predictor="${ATTRIBUTE_PREDICTOR:-}"
+# Use the trained predictor by default; set ATTRIBUTE_PREDICTOR="" to disable.
+attribute_predictor="${ATTRIBUTE_PREDICTOR-${project_root}/checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt}"
 age_tolerance_years="${AGE_TOLERANCE_YEARS:-5}"
 
 dry_run=false
