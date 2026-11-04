@@ -213,8 +213,6 @@ def main(args):
             raise ValueError('Effectiveness requires --attribute-predictor PATH to a trained, held-out evaluated checkpoint.')
     elif args.attribute_predictor:
         raise ValueError('Add effectiveness to --evaluations when supplying --attribute-predictor.')
-    if not np.isfinite(args.age_tolerance_years) or args.age_tolerance_years <= 0:
-        raise ValueError('--age-tolerance-years must be finite and positive.')
     indices = selection['indices']
     if len(indices) < (2 if set(args.evaluations) & {'inception', 'dino'} else 1):
         raise ValueError('Distribution evaluation requires at least two cached images.')
@@ -235,7 +233,7 @@ def main(args):
             raise ValueError('Sampling cache test-split hash differs from the predictor\'s held-out split.')
         if list(sample_config['resolution']) != list(predictor_metadata['resolution']):
             raise ValueError('Sampling cache resolution differs from predictor training preprocessing.')
-        effectiveness = EffectivenessMetrics(args.attributes, args.age_tolerance_years)
+        effectiveness = EffectivenessMetrics(args.attributes)
     dataset = SavedImages(samples_dir, sample_config, selection, records, args.tasks,
                           args.attributes, identity_enabled or args.save_examples > 0)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
@@ -324,9 +322,10 @@ def main(args):
     })
     if effectiveness_enabled:
         metadata['attribute_predictor'] = predictor_metadata
+        metadata['age_metric'] = 'mae_years'
         metadata['notes'].append(
             'Effectiveness compares predicted edited attributes with requested targets on all eligible CFs. '
-            'Categorical target accuracy is higher-is-better; age target errors are in years and lower-is-better. '
+            'Categorical target accuracy is higher-is-better; age target MAE is in years and lower-is-better. '
             'Input-target scores are no-edit diagnostics. Inspect the predictor held-out performance; '
             'prediction agreement is an imperfect proxy for edit success.')
         if sample_config.get('counterfactual_target_policy') == 'uniform_v1':
@@ -429,7 +428,7 @@ def main(args):
         write_csv(folder / 'per_sample.csv', effectiveness.per_sample)
         write_csv(folder / 'summary.csv', rows)
         (folder / 'summary.json').write_text(json.dumps({
-            'metadata': metadata, 'age_tolerance_years': args.age_tolerance_years,
+            'metadata': metadata, 'age_metric': 'mae_years',
             'metrics': rows}, indent=2, allow_nan=False) + '\n')
         for row in rows:
             combined_rows.append(dict(common, family='effectiveness', **row,
@@ -472,7 +471,6 @@ def parse_args(input_args=None):
     parser.add_argument('--samples-dir', required=True)
     parser.add_argument('--evaluations', nargs='+', choices=['identity', 'inception', 'dino', 'effectiveness'], default=['identity', 'inception', 'dino'])
     parser.add_argument('--attribute-predictor', default=None, help='Completed real-image predictor checkpoint; required for effectiveness.')
-    parser.add_argument('--age-tolerance-years', type=float, default=5., help='Age target success tolerance in years; MAE/RMSE are also always reported.')
     parser.add_argument('--identity-metrics', nargs='+', choices=['mae', 'mse', 'ssim', 'lpips'], default=['mae', 'mse', 'ssim', 'lpips'])
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=None, help='Subset of cached tasks; default evaluates all cached tasks.')
     parser.add_argument('--attributes', nargs='+', choices=ATTRIBUTES, default=None, help='Subset of cached CF attributes; default uses all cached attributes.')

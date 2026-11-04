@@ -2,10 +2,10 @@
 
 Categorical effectiveness is argmax accuracy against the *requested target*,
 and balanced target accuracy averages those recalls over represented target
-categories. Age is continuous: MAE/RMSE use years, and the optional success
-rate uses an explicit absolute-error tolerance in years. No score combines
-categorical accuracy with age error. Every eligible counterfactual is included,
-including images whose factual attribute the predictor gets wrong.
+categories. Age is continuous and evaluated with mean absolute error in years.
+No score combines categorical accuracy with age error. Every eligible
+counterfactual is included, including images whose factual attribute the
+predictor gets wrong.
 
 ``input_target`` applies the same target checks to the corresponding input
 images as a no-edit diagnostic. ``real_prediction`` checks real-image labels;
@@ -88,25 +88,20 @@ def _std(values):
 class EffectivenessMetrics:
     """Collect factual diagnostics and paired requested-target effectiveness."""
 
-    def __init__(self, attributes, age_tolerance_years=5.0):
+    def __init__(self, attributes):
         self.attributes = list(dict.fromkeys(attributes))
         if not self.attributes or not set(self.attributes).issubset(ATTRIBUTES):
             raise ValueError(f'Attributes must be a nonempty subset of {ATTRIBUTES}.')
-        self.age_tolerance_years = _finite(age_tolerance_years, 'Age tolerance in years')
-        if self.age_tolerance_years <= 0:
-            raise ValueError('Age tolerance must be positive.')
         self.per_sample = []
         self._seen = set()
 
     def _row(self, index, comparison, attribute, source, target, prediction):
-        error = abs(prediction - target) if attribute == 'age' else None
-        squared_error = _finite(error * error, 'Squared age error') if error is not None else ''
+        error = _finite(abs(prediction - target), 'Absolute age error') if attribute == 'age' else None
         return {
             'index': index, 'comparison': comparison, 'attribute': attribute,
             'source': source, 'target': target, 'prediction': prediction,
-            'success': int(error <= self.age_tolerance_years) if error is not None else int(prediction == target),
+            'success': '' if error is not None else int(prediction == target),
             'absolute_error_years': error if error is not None else '',
-            'squared_error_years': squared_error,
         }
 
     def update_real(self, predictions, factual_rows, indices):
@@ -165,15 +160,8 @@ class EffectivenessMetrics:
         if attribute == 'age':
             prefix = '' if real else 'target_'
             errors = [row['absolute_error_years'] for row in group]
-            squares = [row['squared_error_years'] for row in group]
-            rows = [result(prefix + 'mae_years', statistics.mean(errors) if count else None,
-                           _std(errors)),
-                    result(prefix + 'rmse_years', math.sqrt(statistics.mean(squares)) if count else None)]
-            if not real:
-                success = [row['success'] for row in group]
-                rows.append(result('target_within_tolerance', statistics.mean(success) if count else None,
-                                   _std(success)))
-            return rows
+            return [result(prefix + 'mae_years', statistics.mean(errors) if count else None,
+                           _std(errors))]
         success = [row['success'] for row in group]
         rows = [result('accuracy' if real else 'target_accuracy', statistics.mean(success) if count else None,
                        _std(success))]
@@ -190,7 +178,7 @@ class EffectivenessMetrics:
         Balanced accuracy includes only represented target classes; the number
         of represented classes is explicit in ``n_target_groups``. Standard
         deviations describe per-image variation, not uncertainty intervals;
-        aggregate balanced accuracy and RMSE have no per-image standard deviation.
+        aggregate balanced accuracy has no per-image standard deviation.
         """
         groups = {}
         for row in self.per_sample:

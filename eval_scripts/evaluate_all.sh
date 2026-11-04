@@ -69,8 +69,7 @@ if [ -n "$attribute_predictor" ]; then
         exit 1
     fi
     ARGS+=(--evaluations identity inception dino effectiveness
-           --attribute-predictor="$attribute_predictor"
-           --age-tolerance-years="${AGE_TOLERANCE_YEARS:-5}")
+           --attribute-predictor="$attribute_predictor")
 fi
 
 if [ $# -gt 2 ]; then

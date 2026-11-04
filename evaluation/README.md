@@ -172,16 +172,16 @@ After training and reviewing the held-out results, evaluate saved test images:
   --samples-dir sample_results/EXPERIMENT/step_0065000/test_n1000_seed1234_steps50_ema \
   --evaluations identity inception dino effectiveness \
   --attribute-predictor checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt \
-  --age-tolerance-years 5 \
   --output-dir evaluation/results/EXPERIMENT_with_effectiveness
 ```
 
 Categorical **target accuracy** is the fraction of eligible counterfactuals
 whose predicted edited attribute equals the requested target. **Balanced target
 accuracy** averages this rate across represented target categories; support is
-recorded explicitly. Age reports **target MAE** and **target RMSE in years**,
-plus the fraction within `--age-tolerance-years` (default 5 years, inclusive).
-Categorical accuracy is higher-is-better; age errors are lower-is-better. These
+recorded explicitly. Age reports **target MAE in years**:
+`mean(abs(predicted_age_years - requested_target_age_years))`. The predictor
+already returns years, so no extra normalization or scaling is applied.
+Categorical accuracy is higher-is-better; age MAE is lower-is-better. These
 scores are not combined into a single number.
 
 Every eligible edit counts, including inputs the predictor initially labels
@@ -213,11 +213,10 @@ ATTRIBUTE_PREDICTOR=checkpoints/attribute_predictor/resnet50_256x192_seed1234/be
 ```
 
 Set `ATTRIBUTE_PREDICTOR=""` to disable effectiveness, including when requesting
-a custom `--evaluations` subset that excludes it. `AGE_TOLERANCE_YEARS`
-optionally overrides the default. The comparison report
-adds effectiveness tables, categorical accuracy and age-error panels, factual
+a custom `--evaluations` subset that excludes it. The comparison report
+adds effectiveness tables, categorical accuracy and age MAE panels, factual
 diagnostics, and `effectiveness_targets.csv`. Comparisons reject differing
-predictor fingerprints or age tolerances. With an explicitly empty predictor,
+predictor fingerprints or age metric definitions. With an explicitly empty predictor,
 the existing identity, Inception and DINO evaluation workflow stays available.
 
 ## Results and reporting

@@ -30,7 +30,6 @@ feature_model="dinov2_vitb14"
 save_examples=0
 # Use the trained predictor by default; set ATTRIBUTE_PREDICTOR="" to disable.
 attribute_predictor="${ATTRIBUTE_PREDICTOR-${project_root}/checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt}"
-age_tolerance_years="${AGE_TOLERANCE_YEARS:-5}"
 
 dry_run=false
 if [ "${3:-}" = "--dry-run" ]; then
@@ -103,8 +102,7 @@ if [ -n "$attribute_predictor" ]; then
         exit 1
     fi
     EVAL_ARGS+=(--evaluations identity inception dino effectiveness
-                --attribute-predictor="$attribute_predictor"
-                --age-tolerance-years="$age_tolerance_years")
+                --attribute-predictor="$attribute_predictor")
 fi
 
 SUMMARY_ARGS=(

@@ -282,8 +282,6 @@ def _effectiveness_table(rows, methods, attributes):
             count = primary.get("n_generated") or primary.get("n_real") or "0"
             if attribute == "age":
                 age.append([method, count, _format(_score(primary)),
-                            _format(_score(metric("cf_target", "target_rmse_years"))),
-                            _format(_score(metric("cf_target", "target_within_tolerance"))),
                             _format(_score(metric("input_target", "target_mae_years"))), _support(primary)])
             else:
                 categorical.append([attribute.title(), method, count, _format(_score(primary)),
@@ -292,7 +290,7 @@ def _effectiveness_table(rows, methods, attributes):
     return ("### Categorical interventions\n\n" + _table(
         ["Attribute", "Method", "Images", "Target accuracy ↑", "Balanced target accuracy ↑", "Input target accuracy", "Support"], categorical)
         + "\n### Age interventions\n\n" + _table(
-        ["Method", "Images", "Target MAE (years) ↓", "Target RMSE (years) ↓", "Within tolerance ↑", "Input target MAE (years)", "Support"], age))
+        ["Method", "Images", "Target MAE (years) ↓", "Input target MAE (years)", "Support"], age))
 
 
 def _predictor_diagnostics(rows, methods, predictor):
@@ -302,12 +300,11 @@ def _predictor_diagnostics(rows, methods, predictor):
         metrics = heldout.get(attribute, {})
         heldout_rows.append([attribute.title(), heldout.get("n", "—"),
                              _format(metrics.get("accuracy")), _format(metrics.get("balanced_accuracy")),
-                             _format(metrics.get("macro_f1")), _format(metrics.get("mae_years")),
-                             _format(metrics.get("rmse_years"))])
+                             _format(metrics.get("macro_f1")), _format(metrics.get("mae_years"))])
     cached_rows = []
     for attribute in ATTRIBUTES:
         for method in methods:
-            names = ("mae_years", "rmse_years") if attribute == "age" else ("accuracy", "balanced_accuracy")
+            names = ("mae_years",) if attribute == "age" else ("accuracy", "balanced_accuracy")
             selected = [_find(rows, method, "effectiveness", "real_prediction", attribute, metric, "all")
                         for metric in names]
             if not any(selected):
@@ -319,7 +316,7 @@ def _predictor_diagnostics(rows, methods, predictor):
     return ("### Predictor quality on held-out real test patients\n\n"
             "The shared predictor checkpoint records the following held-out test performance after validation-based checkpoint selection. "
             "These results qualify the measurement model; they are not counterfactual effectiveness scores.\n\n"
-            + _table(["Attribute", "Images", "Accuracy ↑", "Balanced accuracy ↑", "Macro F1 ↑", "MAE (years) ↓", "RMSE (years) ↓"], heldout_rows)
+            + _table(["Attribute", "Images", "Accuracy ↑", "Balanced accuracy ↑", "Macro F1 ↑", "MAE (years) ↓"], heldout_rows)
             + "\n### Predictor diagnostics on the cached factual images\n\n"
             "These diagnostics use the same cached factual cohort as the counterfactuals. They describe predictor behavior on that cohort "
             "and do not replace its held-out test evaluation.\n\n"
@@ -454,12 +451,11 @@ def build_report(output_dir: Path, runs: dict, protocol: dict) -> list[Path]:
     report_path = output_dir / "report.md"
     if effectiveness:
         predictor = protocol.get("attribute_predictor", {})
-        tolerance = settings.get("age_tolerance_years", "recorded in config.json")
         section = ["## Counterfactual effectiveness", "",
                    "A shared frozen attribute predictor scores each requested edit against its target. Categorical target accuracy "
-                   "is the fraction whose predicted category equals the requested category. Age is evaluated in years; lower target "
-                   "MAE/RMSE and a higher within-tolerance fraction indicate greater effectiveness. "
-                   f"The age tolerance is **{tolerance} years**. All eligible interventions are scored, including those whose factual prediction is incorrect.", "",
+                   "is the fraction whose predicted category equals the requested category. Age effectiveness is mean absolute error "
+                   "in years between the predicted age and requested target age; lower MAE indicates greater effectiveness. "
+                   "All eligible interventions are scored, including those whose factual prediction is incorrect.", "",
                    "The input-target columns apply the same predictor to the unchanged factual image against the intervention target. "
                    "They expose how often an unchanged image already appears to satisfy the request. They are diagnostics, not effectiveness gains. "
                    "Balanced target accuracy averages recall across supported target categories. Rates are fractions in [0, 1]. "
@@ -523,14 +519,16 @@ def _predictor_protocol(config, rows, method):
         digest = predictor.get(key)
         if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ValueError(f"{method}: attribute_predictor has an invalid {key}")
-    tolerance = _number(config["arguments"].get("age_tolerance_years"))
-    if tolerance is None or tolerance <= 0:
-        raise ValueError(f"{method}: effectiveness requires a positive age_tolerance_years")
+    # Earlier reports also contain MAE in years; their tolerance applies only to
+    # an obsolete success-rate metric and does not change MAE comparability.
+    age_metric = config.get("age_metric", "mae_years")
+    if age_metric != "mae_years":
+        raise ValueError(f"{method}: unsupported age metric {age_metric!r}; expected mae_years")
     # Equivalent checkpoint files may be mounted at different paths. Fingerprints,
     # preprocessing and recorded predictor quality establish comparability.
     identity = {key: value for key, value in predictor.items()
                 if key not in ("path", "checkpoint", "checkpoint_path")}
-    return {"predictor": identity, "age_tolerance_years": tolerance}
+    return {"predictor": identity, "age_metric": age_metric}
 
 
 def validate_results(runs):
@@ -601,7 +599,7 @@ def validate_results(runs):
             if configs[method].get(key) != reference.get(key):
                 raise ValueError(f"{method}: counterfactual target protocol {key} differs from LDM")
         if predictors[method] != predictors["LDM"]:
-            raise ValueError(f"{method}: attribute predictor or age tolerance differs from LDM")
+            raise ValueError(f"{method}: attribute predictor or age metric differs from LDM")
     protocol = {
         "step": reference["step"], "settings": reference["arguments"],
         "experiments": {method: {"name": config["experiment"], "checkpoint": config["checkpoint"]}
@@ -615,6 +613,7 @@ def validate_results(runs):
     }
     if predictors["LDM"] is not None:
         protocol["attribute_predictor"] = predictors["LDM"]["predictor"]
+        protocol["age_metric"] = predictors["LDM"]["age_metric"]
     protocol.update({key: reference[key] for key in TARGET_PROTOCOL_METADATA if key in reference})
     return protocol, selections["LDM"], fingerprints
 

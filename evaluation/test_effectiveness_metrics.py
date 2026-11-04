@@ -1,5 +1,5 @@
 """Synthetic correctness tests; no data, model training or GPU is needed."""
-import math
+import statistics
 from pathlib import Path
 import sys
 import unittest
@@ -44,15 +44,49 @@ class EffectivenessTests(unittest.TestCase):
         self.assertEqual((balanced['value'], balanced['n_target_groups']), (.5, 2))
         self.assertEqual(metric(scorer, 'cf_target', 'density', 'target_accuracy', '2')['value'], 0)
 
-    def test_age_years_tolerance_inclusive_and_predictions_unclamped(self):
-        scorer = EffectivenessMetrics(['age'], age_tolerance_years=5)
+    def test_age_mae_years_and_predictions_unclamped(self):
+        scorer = EffectivenessMetrics(['age'])
         rows = [{'source': '50', 'target': '60', 'age': '60'},
                 {'source': '90', 'target': '100', 'age': '100'}]
         scorer.update_counterfactual('age', {'age': [55.0, 110.0]}, {'age': [50., 90.]}, rows, [0, 1])
         self.assertEqual(metric(scorer, 'cf_target', 'age', 'target_mae_years')['value'], 7.5)
-        self.assertAlmostEqual(metric(scorer, 'cf_target', 'age', 'target_rmse_years')['value'], math.sqrt(62.5))
-        self.assertEqual(metric(scorer, 'cf_target', 'age', 'target_within_tolerance')['value'], .5)
+        self.assertEqual(metric(scorer, 'input_target', 'age', 'target_mae_years')['value'], 10.)
+        self.assertEqual({row['metric'] for row in scorer.summaries()}, {'mae_years', 'target_mae_years'})
         self.assertEqual(scorer.per_sample[2]['prediction'], 110.)
+        self.assertEqual(scorer.per_sample[2]['absolute_error_years'], 10.)
+        for row in scorer.per_sample:
+            self.assertEqual(row['success'], '')
+            self.assertNotIn('squared_error_years', row)
+
+    def test_age_mae_aggregates_observations_across_unequal_batches(self):
+        scorer = EffectivenessMetrics(['age'])
+        scorer.update_counterfactual('age', {'age': [58.]}, {'age': [50.]},
+                                     [{'source': '50', 'target': '60', 'age': '60'}], [0])
+        scorer.update_counterfactual('age', {'age': [90., 81.]}, {'age': [70., 80.]},
+                                     [{'source': '70', 'target': '80', 'age': '80'},
+                                      {'source': '80', 'target': '80', 'age': '80'}], [1, 2])
+        scored = metric(scorer, 'cf_target', 'age', 'target_mae_years')
+        self.assertAlmostEqual(scored['value'], 13. / 3.)
+        self.assertAlmostEqual(scored['std'], statistics.stdev([2., 10., 1.]))
+        self.assertEqual((scored['n_generated'], scored['status']), (3, 'ok'))
+        self.assertAlmostEqual(metric(scorer, 'input_target', 'age', 'target_mae_years')['value'], 20. / 3.)
+
+    def test_empty_age_metrics_are_unavailable(self):
+        scorer = EffectivenessMetrics(['age'])
+        self.assertEqual(len(scorer.summaries()), 3)
+        for row in scorer.summaries():
+            self.assertIsNone(row['value'])
+            self.assertIsNone(row['std'])
+            self.assertEqual(row['n_generated'], 0)
+            expected = 'no_predictions' if row['comparison'] == 'real_prediction' else 'no_interventions'
+            self.assertEqual(row['status'], expected)
+
+    def test_large_finite_age_errors_do_not_require_squaring(self):
+        scorer = EffectivenessMetrics(['age'])
+        scorer.update_real({'age': [1e308]}, [{'age': '50'}], [0])
+        scored = metric(scorer, 'real_prediction', 'age', 'mae_years')
+        self.assertEqual(scored['value'], 1e308)
+        self.assertIsNone(scored['std'])
 
     def test_real_diagnostics_and_absent_interventions(self):
         scorer = EffectivenessMetrics(['view', 'age'])
@@ -65,10 +99,7 @@ class EffectivenessTests(unittest.TestCase):
                 self.assertEqual((row['value'], row['n_generated'], row['status']),
                                  (None, 0, 'no_interventions'))
 
-    def test_reject_bad_tolerance_and_schema(self):
-        for tolerance in [0, -1, float('nan'), float('inf')]:
-            with self.subTest(tolerance=tolerance), self.assertRaises(ValueError):
-                EffectivenessMetrics(['age'], tolerance)
+    def test_reject_unknown_attribute_schema(self):
         with self.assertRaises(ValueError):
             EffectivenessMetrics(['unknown'])
 
@@ -108,11 +139,6 @@ class EffectivenessTests(unittest.TestCase):
         scorer = EffectivenessMetrics(['view', 'age'])
         with self.assertRaises(ValueError):
             scorer.update_real({'view': [[2, 0]], 'age': [float('inf')]},
-                               [{'view': '0', 'age': '50'}], [0])
-        self.assertEqual(scorer.per_sample, [])
-        # A finite but numerically unusable prediction must also fail cleanly.
-        with self.assertRaises(ValueError):
-            scorer.update_real({'view': [[2, 0]], 'age': [1e308]},
                                [{'view': '0', 'age': '50'}], [0])
         self.assertEqual(scorer.per_sample, [])
 

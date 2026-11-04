@@ -62,7 +62,7 @@ class EffectivenessReportTests(unittest.TestCase):
             identity_metrics=['mae', 'mse', 'ssim'], tasks=['reconstruction', 'counterfactual'],
             attributes=['view', 'age'], target_view=None, target_density=None,
             target_scanner=None, target_age=None, age_bin_edges=[0, 40, 60, 101],
-            feature_model='dinov2_vitb14', age_tolerance_years=5.)
+            feature_model='dinov2_vitb14')
         predictor = dict(
             checkpoint_sha256='b' * 64, state_dict_sha256='c' * 64,
             checkpoint_path=f'/mounted/on/{method}/attribute_predictor.pt',
@@ -83,7 +83,7 @@ class EffectivenessReportTests(unittest.TestCase):
             inference='synthetic saved-image fixture', feature_extractors={},
             source_sha256={}, image_storage={'format': 'synthetic uint16 grayscale PNG'},
             sampling_source_sha256={}, reference_images_sha256='f' * 64,
-            arguments=arguments, attribute_predictor=predictor)
+            arguments=arguments, attribute_predictor=predictor, age_metric='mae_years')
         self.assertTrue(set(reporting.PROTOCOL_METADATA).issubset(config))
         self.assertTrue(set(reporting.PROTOCOL_ARGUMENTS).issubset(arguments))
         return config
@@ -102,14 +102,11 @@ class EffectivenessReportTests(unittest.TestCase):
             self.row('cf_target', 'view', 'target_accuracy', .75, target='1'),
             self.row('input_target', 'view', 'target_accuracy', .25, target='1'),
             self.row('cf_target', 'age', 'target_mae_years', 3.5),
-            self.row('cf_target', 'age', 'target_rmse_years', 4.5),
-            self.row('cf_target', 'age', 'target_within_tolerance', .5),
             self.row('input_target', 'age', 'target_mae_years', 10.),
             self.row('cf_target', 'age', 'target_mae_years', 3.5, target='60'),
             self.row('real_prediction', 'view', 'accuracy', .9),
             self.row('real_prediction', 'view', 'balanced_accuracy', .9),
             self.row('real_prediction', 'age', 'mae_years', 4.),
-            self.row('real_prediction', 'age', 'rmse_years', 5.),
             self.row('vae_vs_input', 'none', 'mae', .01, family='identity'),
             self.row('cycle_vs_input', 'none', 'mae', .02, family='identity'),
             self.row('cf_vs_input', 'view', 'mae', .03, family='identity'),
@@ -137,10 +134,17 @@ class EffectivenessReportTests(unittest.TestCase):
                     reporting.validate_results(self.runs)
                 self.write_json(self.runs['REPA'] / 'config.json', self.config('REPA'))
 
-    def test_reject_different_age_tolerances(self):
-        self.change_config('REPA-E', lambda config: config['arguments'].update(age_tolerance_years=2.))
-        with self.assertRaisesRegex(ValueError, 'age tolerance'):
+    def test_reject_unsupported_age_metric(self):
+        self.change_config('REPA-E', lambda config: config.update(age_metric='rmse_years'))
+        with self.assertRaisesRegex(ValueError, 'age metric'):
             reporting.validate_results(self.runs)
+
+    def test_legacy_age_tolerances_do_not_change_mae_comparability(self):
+        self.change_config('REPA', lambda config: config.pop('age_metric'))
+        self.change_config('LDM', lambda config: config['arguments'].update(age_tolerance_years=5.))
+        self.change_config('REPA-E', lambda config: config['arguments'].update(age_tolerance_years=2.))
+        protocol, _, _ = reporting.validate_results(self.runs)
+        self.assertEqual(protocol['age_metric'], 'mae_years')
 
     def test_reject_different_counterfactual_target_assignments(self):
         for method in reporting.METHODS:
@@ -162,7 +166,7 @@ class EffectivenessReportTests(unittest.TestCase):
         for method, directory in self.runs.items():
             config = self.config(method)
             config['arguments']['evaluations'] = ['identity']
-            config['arguments'].pop('age_tolerance_years')
+            config.pop('age_metric')
             config.pop('attribute_predictor')
             self.write_json(directory / 'config.json', config)
             self.write_rows(directory, [row for row in self.rows() if row['family'] == 'identity'])
@@ -174,12 +178,30 @@ class EffectivenessReportTests(unittest.TestCase):
         rows = [dict(row, method='LDM') for row in self.rows()]
         table = reporting._effectiveness_table(rows, ['LDM'], ['view', 'age'])
         for heading in ('Target accuracy ↑', 'Balanced target accuracy ↑',
-                        'Target MAE (years) ↓', 'Target RMSE (years) ↓', 'Within tolerance ↑'):
+                        'Target MAE (years) ↓'):
             self.assertIn(heading, table)
         self.assertIn('0.75', table)
         self.assertIn('3.5', table)
         self.assertIn('Input target accuracy', table)
         self.assertIn('Input target MAE (years)', table)
+        self.assertNotIn('RMSE', table)
+        self.assertNotIn('tolerance', table)
+
+    def test_legacy_age_metrics_are_omitted_from_report_tables(self):
+        rows = [dict(row, method='LDM') for row in self.rows()]
+        rows.extend(dict(row, method='LDM') for row in [
+            self.row('cf_target', 'age', 'target_rmse_years', 4.5),
+            self.row('cf_target', 'age', 'target_within_tolerance', .5),
+            self.row('real_prediction', 'age', 'rmse_years', 5.),
+        ])
+        table = reporting._effectiveness_table(rows, ['LDM'], ['view', 'age'])
+        diagnostics = reporting._predictor_diagnostics(
+            rows, ['LDM'], self.config('LDM')['attribute_predictor'])
+        for text in (table, diagnostics):
+            self.assertNotIn('RMSE', text)
+            self.assertNotIn('rmse_years', text)
+            self.assertNotIn('tolerance', text)
+        self.assertIn('mae_years', diagnostics)
 
     def test_build_report_renders_synthetic_effectiveness_png_and_pdf(self):
         protocol, _, _ = reporting.validate_results(self.runs)
@@ -191,7 +213,10 @@ class EffectivenessReportTests(unittest.TestCase):
         self.assertIn('## Counterfactual effectiveness', report)
         self.assertIn('held-out real test patients', report)
         self.assertIn('cached factual images', report)
-        self.assertIn('**5.0 years**', report)
+        self.assertIn('mean absolute error', report)
+        self.assertIn('Target MAE (years) ↓', report)
+        self.assertNotIn('RMSE', report)
+        self.assertNotIn('tolerance', report)
         self.assertIn('Checkpoint SHA256', report)
         self.assertIn('b' * 64, report)
         self.assertIn('Balanced target accuracy ↑', report)

@@ -66,7 +66,7 @@ class SavedEffectivenessTest(unittest.TestCase):
         return evaluate_all.parse_args([
             '--samples-dir', str(self.cache), '--evaluations', 'identity', 'effectiveness',
             '--identity-metrics', 'mae', 'mse', 'ssim', '--attribute-predictor', 'synthetic.pt',
-            '--age-tolerance-years', '1', '--batch-size', '2', '--device', 'cpu',
+            '--batch-size', '2', '--device', 'cpu',
             '--cpu-threads', '1', '--output-root', str(self.root / 'results'), *extra])
 
     def test_saved_cache_scores_requested_targets_and_keeps_existing_metrics(self):
@@ -90,12 +90,23 @@ class SavedEffectivenessTest(unittest.TestCase):
         self.assertEqual(float(view['value']), .5)
         self.assertEqual(int(view['n_generated']), 2)
         self.assertEqual(float(find('age', 'target_mae_years')['value']), 1.)
-        self.assertEqual(float(find('age', 'target_within_tolerance')['value']), .5)
+        self.assertEqual(float(find('age', 'target_mae_years', 'input_target')['value']), 7.5)
+        self.assertEqual({row['metric'] for row in rows
+                          if row['family'] == 'effectiveness' and row['attribute'] == 'age'},
+                         {'target_mae_years', 'mae_years'})
         self.assertEqual(float(find('age', 'mae_years', 'real_prediction')['value']), 2.5)
         self.assertTrue(any(row['family'] == 'identity' and row['metric'] == 'ssim' for row in rows))
         self.assertEqual(before, (self.cache / 'samples.csv').read_bytes())
         self.assertEqual(json.loads((output / 'config.json').read_text())['status'], 'complete')
-        self.assertTrue((output / 'effectiveness/per_sample.csv').is_file())
+        summary = json.loads((output / 'effectiveness/summary.json').read_text())
+        self.assertEqual(summary['age_metric'], 'mae_years')
+        self.assertEqual(summary['metadata']['age_metric'], 'mae_years')
+        self.assertNotIn('age_tolerance_years', summary)
+        self.assertNotIn('age_tolerance_years', summary['metadata']['arguments'])
+        with (output / 'effectiveness/per_sample.csv').open() as handle:
+            per_sample = list(csv.DictReader(handle))
+        self.assertTrue(all(row['success'] == '' for row in per_sample if row['attribute'] == 'age'))
+        self.assertTrue(all('squared_error_years' not in row for row in per_sample))
 
     def test_predictor_test_split_must_match(self):
         self.predictor_metadata['split_csv_sha256']['test'] = 'd' * 64
