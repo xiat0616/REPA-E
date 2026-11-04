@@ -83,9 +83,18 @@ class EffectivenessTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(ValueError):
                 EffectivenessMetrics(['view']).update_real({'view': [[1, 0]]}, [{'view': label}], [0])
 
-    def test_reject_inconsistent_noop_or_duplicate_records(self):
+    def test_same_target_controls_are_retained_and_scored(self):
+        predictions = {'view': [[0, 1]]}
+        scorer = EffectivenessMetrics(['view'])
+        scorer.update_counterfactual('view', predictions, predictions,
+                                     [{'source': '1', 'target': '1', 'view': '1'}], [0])
+        self.assertEqual(metric(scorer, 'cf_target', 'view', 'target_accuracy')['value'], 1.)
+        self.assertEqual(metric(scorer, 'input_target', 'view', 'target_accuracy')['value'], 1.)
+        self.assertEqual(len(scorer.per_sample), 2)
+
+    def test_reject_inconsistent_or_duplicate_records(self):
         predictions = {'view': [[1, 0]]}
-        for row in [{'source': '1', 'target': '1'}, {'source': '0', 'target': '1', 'view': '0'},
+        for row in [{'source': '0', 'target': '1', 'view': '0'},
                     {'source': '0', 'target': '1', 'attribute': 'density'}]:
             with self.subTest(row=row), self.assertRaises(ValueError):
                 EffectivenessMetrics(['view']).update_counterfactual('view', predictions, predictions, [row], [0])

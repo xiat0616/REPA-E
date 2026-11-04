@@ -107,6 +107,13 @@ def reference_images_hash(records):
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
+def counterfactual_targets_hash(records):
+    """Fingerprint actual assignments independently of record order and model outputs."""
+    values = sorted((int(row['index']), row['attribute'], float(row['source']), float(row['target']))
+                    for row in records if row['task'] == 'counterfactual')
+    return hashlib.sha256(json.dumps(values, allow_nan=False).encode()).hexdigest()
+
+
 def load_samples(root):
     """Validate cache metadata/relationships without loading all PNG byte payloads."""
     import math
@@ -201,7 +208,6 @@ def load_samples(root):
             except ValueError as error:
                 raise ValueError('Counterfactual source/target values must be numeric.') from error
             if (not math.isfinite(source) or not math.isfinite(target)
-                    or math.isclose(source, target, abs_tol=1e-6)
                     or not math.isclose(source, float(factual[attribute]), abs_tol=1e-4)
                     or not math.isclose(target, float(row[attribute]), abs_tol=1e-4)):
                 raise ValueError('Counterfactual intervention metadata is inconsistent.')
@@ -212,6 +218,11 @@ def load_samples(root):
                     raise ValueError('Output metadata unexpectedly changes a factual attribute.')
     if counts != config.get('eligible_interventions', {}):
         raise ValueError('Counterfactual image counts do not match the sampling configuration.')
+    if config.get('counterfactual_target_policy') == 'uniform_v1':
+        if 'counterfactual' in tasks and counts != {attribute: len(indices) for attribute in requested_attributes}:
+            raise ValueError('Uniform target caches must retain every requested draw, including same-target controls.')
+        if config.get('counterfactual_targets_sha256') != counterfactual_targets_hash(records):
+            raise ValueError('Counterfactual target assignments do not match their recorded fingerprint.')
     if config.get('reference_images_sha256') != reference_images_hash(records):
         raise ValueError('Factual-image checksums do not match the sampling configuration.')
     return config, selection, records

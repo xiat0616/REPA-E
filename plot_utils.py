@@ -7,6 +7,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from torchvision.utils import make_grid
 
 from samplers import euler_sampler
+from sample.counterfactual_targets import load_training_age_range, make_counterfactual_parents
 from utils import denormalize_latents, preprocess_imgs_vae
 
 
@@ -102,22 +103,6 @@ def _batch_to_parents(batch, device):
     }
 
 
-def make_counterfactual_parents(parents, attr):
-    cf = {k: v.clone() for k, v in parents.items()}
-    if attr == 'view':
-        cf['view'] = torch.roll(cf['view'], shifts=1, dims=1)
-    elif attr == 'density':
-        cf['density'] = torch.roll(cf['density'], shifts=1, dims=1)
-    elif attr == 'scanner':
-        cf['scanner'] = torch.roll(cf['scanner'], shifts=1, dims=1)
-    elif attr == 'age':
-        age = cf['age']
-        cf['age'] = torch.where(age <= 0.9, age + 0.1, age - 0.1).clamp(0, 1)
-    else:
-        raise ValueError(f'Unknown counterfactual attribute: {attr}')
-    return cf
-
-
 @torch.no_grad()
 def prepare_ema_sampling_inputs(val_dataloader, accelerator, args, in_channels, latent_size):
     local_sample_count = max(1, math.ceil(args.num_sample_images / accelerator.num_processes))
@@ -208,9 +193,14 @@ def make_counterfactual_grid(ema, vae, val_dataloader, accelerator, args):
     parents = slice_parents(parents, n)
     z0 = encode_flow_input(ema, vae, original)
     zT = flow_euler(ema, z0, parents, t_start=0.0, t_end=1.0, num_steps=args.counterfactual_num_steps)
+    age_range_years = load_training_age_range(args.split_dir)
+    # Fixed per-image draws keep previews comparable without consuming training RNG.
+    preview_indices = [accelerator.process_index * n + index for index in range(n)]
     counterfactuals = []
     for attr in ['view', 'density', 'scanner', 'age']:
-        cf_parents = make_counterfactual_parents(parents, attr)
+        cf_parents = make_counterfactual_parents(
+            parents, attr, seed=args.sample_seed, indices=preview_indices,
+            age_range_years=age_range_years)
         z_cf = flow_euler(ema, zT, cf_parents, t_start=1.0, t_end=0.0, num_steps=args.counterfactual_num_steps)
         counterfactuals.append(decode_flow_latent(ema, vae, z_cf))
     originals = accelerator.gather(original.float())

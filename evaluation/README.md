@@ -15,6 +15,12 @@ The workflow follows `diffusion_counterfactual`: sample PNGs and metadata first,
 then score saved images. `evaluate_all.py` does not load the generative checkpoint,
 VAE, or raw dataset. Recomputing metrics never generates images again.
 
+New sampling runs draw categorical targets uniformly from all classes, including
+the source class; age targets are uniform within the training split's age range.
+These caches have an `_uniform` suffix, selected by the comparison launcher by
+default. To evaluate older cyclic-target caches, set `SAMPLE_SUFFIX=""` when
+calling `compare_experiments.sh`. New and old policies should be reported separately.
+
 ## Three-baseline workflow
 
 Sampling has its own launcher in `sample_scripts/`. Edit the three experiment
@@ -52,14 +58,14 @@ cluster. Evaluate only completed caches containing a `COMPLETE` marker.
 
 ```bash
 bash eval_scripts/evaluate_all.sh gpus48 \
-  sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
+  sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform
 ```
 
 Direct Python, inside an allocation:
 
 ```bash
 .venv/bin/python evaluation/evaluate_all.py \
-  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema \
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform \
   --evaluations identity --identity-metrics mae mse ssim \
   --output-dir evaluation/results/my_identity_evaluation
 ```
@@ -162,7 +168,7 @@ After training and reviewing the held-out results, evaluate saved test images:
 
 ```bash
 .venv/bin/python evaluation/evaluate_all.py \
-  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n1000_seed1234_steps50_ema \
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n1000_seed1234_steps50_ema_uniform \
   --evaluations identity inception dino effectiveness \
   --attribute-predictor checkpoints/attribute_predictor/resnet50_256x192_seed1234/best.pt \
   --age-tolerance-years 5 \
@@ -184,6 +190,12 @@ against factual labels on the cached cohort. These factual diagnostics accompany
 the checkpoint's held-out quality report. Attributes without interventions are
 N/A rather than zero. Other attributes are not scored as preservation targets:
 an intervention can legitimately affect causally related attributes.
+
+Uniform-target caches retain same-target draws as no-edit controls, and these
+controls count in the overall target scores. They can increase target accuracy
+without requiring an attribute change; compare against `input_target` and inspect
+source/target values in `effectiveness/per_sample.csv`. The comparison report
+also verifies that methods used identical actual target assignments and age bounds.
 
 The run writes `effectiveness/per_sample.csv`, `effectiveness/summary.csv`, and
 `effectiveness/summary.json`, and includes the new metric rows in the standard

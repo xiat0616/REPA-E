@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'evaluation'))
 import evaluate_all
-from sample.sample_io import (IMAGE_STORAGE, reference_images_hash, save_json,
+from sample.sample_io import (IMAGE_STORAGE, counterfactual_targets_hash, reference_images_hash, save_json,
                               write_image, write_records)
 
 
@@ -103,6 +103,40 @@ class SavedEffectivenessTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'test-split hash'):
                 evaluate_all.main(self.args())
         self.assertFalse((self.root / 'results').exists())
+
+    def test_uniform_cache_includes_same_target_controls(self):
+        with (self.cache / 'samples.csv').open() as handle:
+            records = list(csv.DictReader(handle))
+        for row in records:
+            if row['task'] == 'counterfactual' and row['attribute'] == 'view' and row['index'] == '0':
+                row['target'] = row['view'] = row['source']
+        write_records(self.cache, records)
+        self.config.update(counterfactual_target_policy='uniform_v1',
+                           counterfactual_targets_sha256=counterfactual_targets_hash(records))
+        save_json(self.cache / 'config.json', self.config)
+        predictions = [
+            dict(view=torch.tensor([[2., 0.], [0., 2.]]), age=torch.tensor([40., 60.])),
+            dict(view=torch.tensor([[2., 0.], [2., 0.]]), age=torch.tensor([40., 60.])),
+            dict(view=torch.tensor([[2., 0.], [0., 2.]]), age=torch.tensor([50., 70.])),
+        ]
+        with patch('attribute_predictor.load_predictor',
+                   return_value=(Mock(side_effect=predictions), self.predictor_metadata)):
+            output = evaluate_all.main(self.args())
+        with (output / 'effectiveness/summary.csv').open() as handle:
+            rows = list(csv.DictReader(handle))
+        score = next(row for row in rows if row['comparison'] == 'cf_target'
+                     and row['attribute'] == 'view' and row['target'] == 'all'
+                     and row['metric'] == 'target_accuracy')
+        self.assertEqual((float(score['value']), int(score['n_generated'])), (1., 2))
+        self.assertTrue(output.name.endswith('_uniform'))
+        metadata = json.loads((output / 'config.json').read_text())
+        self.assertEqual(metadata['counterfactual_targets_sha256'], self.config['counterfactual_targets_sha256'])
+
+    def test_uniform_cache_rejects_changed_target_assignment(self):
+        self.config.update(counterfactual_target_policy='uniform_v1', counterfactual_targets_sha256='f' * 64)
+        save_json(self.cache / 'config.json', self.config)
+        with self.assertRaisesRegex(ValueError, 'target assignments'):
+            evaluate_all.main(self.args())
 
     def test_missing_predictor_fails_before_loading_models(self):
         with self.assertRaisesRegex(ValueError, 'requires --attribute-predictor'):

@@ -21,8 +21,23 @@ The sampler loads the checkpoint and raw dataset once. It saves real inputs,
 fresh generation, VAE reconstructions, no-edit flow reconstructions, and each
 requested counterfactual. Sampling does not load metric feature models.
 
+Default counterfactual targets are uniform random draws, independent of the
+source value: view draws from 0–1, density from 0–3, and scanner from 0–4.
+The source class is included with the same probability as every other class.
+Age draws continuously and uniformly between the minimum and maximum `age`
+in the training split's `train.csv`, rather than adding ten years. All other
+conditions remain factual. Explicit `--target-view`, `--target-density`,
+`--target-scanner`, and `--target-age` values still override the random draws.
+
+Targets are keyed by seed, split-CSV row index and attribute, so the same input
+receives the same target across LDM, REPA, REPA-E and checkpoint steps, regardless
+of batch size, global random state or requested attribute order. This is random
+uniform sampling; finite cohorts need not contain exactly equal target counts.
+The training age bounds, training-CSV checksum, policy and actual target-assignment
+checksum are recorded in `config.json`.
+
 ```text
-sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema/
+sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform/
   config.json
   indices.json
   samples.csv
@@ -59,14 +74,15 @@ a checkpoint or resampling:
 
 ```bash
 .venv/bin/python sample/visualize_counterfactuals.py \
-  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema
+  --samples-dir sample_results/EXPERIMENT/step_0065000/test_n5000_seed1234_steps50_ema_uniform
 ```
 
 `sample_io.py` defines the portable image/manifest format shared with evaluation.
 PNG paths are relative to the cache folder. Filenames use stable split-CSV row
 indices. The CSV links outputs to factual inputs and records task, conditions,
-intervention source/target, and image checksums. No-op interventions have no CF
-row. `COMPLETE` is written only after the export finishes successfully.
+intervention source/target, and image checksums. Same-target draws are retained
+as no-edit controls with a CF row; they are not redrawn or filtered out.
+`COMPLETE` is written only after the export finishes successfully.
 
 Images are 16-bit grayscale PNGs, encoded as
 `round(clamp(image,0,1)*65535)` and read with the fixed divisor 65535. References
@@ -78,6 +94,9 @@ the same saved-image protocol.
 Existing export directories are preserved. To rerun an incomplete export, use a
 new `--output-dir`. Completed folders can be moved without their checkpoint or
 raw dataset because all images and metadata needed for evaluation are included.
+New default folders end in `_uniform`, keeping them separate from previous cyclic
+exports. Sampling and comparison launchers use this suffix by default. Set
+`SAMPLE_SUFFIX=""` on the comparison launcher to evaluate older unsuffixed caches.
 
 Slurm logs and the captured Python output are saved inside each sampling run's
 own `logs/` folder. Three-baseline submissions also record that experiment's

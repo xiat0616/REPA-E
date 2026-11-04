@@ -16,7 +16,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from sample.sample_io import IMAGE_STORAGE, reference_images_hash, save_json, sha256_file, write_image, write_records
+from sample.sample_io import (IMAGE_STORAGE, counterfactual_targets_hash,
+                            reference_images_hash, save_json, sha256_file, write_image, write_records)
 
 ATTRIBUTES = ('view', 'density', 'scanner', 'age')
 
@@ -112,12 +113,15 @@ def build_dataset(data_dir, frame, split, height, width):
 
 
 
-def make_intervention(parents, attribute, args):
+def make_intervention(parents, attribute, args, *, indices=None, age_range_years=None):
+    import torch
+
     target = getattr(args, 'target_' + attribute)
     if target is None:
-        from plot_utils import make_counterfactual_parents
-        # Matches training plots: next category, or age+10 years (age-10 above90).
-        changed = make_counterfactual_parents(parents, attribute)
+        from sample.counterfactual_targets import make_counterfactual_parents
+        changed = make_counterfactual_parents(
+            parents, attribute, seed=args.seed, indices=indices,
+            age_range_years=age_range_years)
     else:
         changed = {key: value.clone() for key, value in parents.items()}
         if attribute == 'age':
@@ -125,7 +129,8 @@ def make_intervention(parents, attribute, args):
         else:
             changed[attribute].zero_()
             changed[attribute][:, target] = 1
-    eligible = (changed[attribute] - parents[attribute]).abs().flatten(1).amax(1) > 1e-6
+    # Keep same-target controls; dropping them would condition the uniform draws.
+    eligible = torch.ones(len(parents[attribute]), device=parents[attribute].device, dtype=torch.bool)
     return changed, eligible
 
 
@@ -141,6 +146,7 @@ def _sample(args):
     from torch.utils.data import DataLoader, Subset
     from tqdm import tqdm
     from plot_utils import decode_flow_latent, flow_euler
+    from sample.counterfactual_targets import load_training_age_range
     from samplers import euler_sampler
     from utils import preprocess_imgs_vae
 
@@ -165,6 +171,13 @@ def _sample(args):
         split_dir = ROOT / split_dir
     split_file = split_dir / f'{args.split}.csv'
     split_hash = sha256_file(split_file)
+    age_range_years = None
+    training_age_csv_sha256 = None
+    if 'counterfactual' in args.tasks and 'age' in args.attributes and args.target_age is None:
+        training_age_csv_sha256 = sha256_file(split_dir / 'train.csv')
+        age_range_years = load_training_age_range(split_dir)
+        if training_age_csv_sha256 != sha256_file(split_dir / 'train.csv'):
+            raise RuntimeError('Training split changed while determining age target bounds.')
     frame = pd.read_csv(split_file, low_memory=False)
     if args.indices_file:
         selection = json.loads(Path(args.indices_file).expanduser().read_text())
@@ -189,12 +202,12 @@ def _sample(args):
     output_root = Path(args.output_root).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else (
         output_root / experiment / f'step_{step_label}' /
-        f'{args.split}_n{args.num_samples}_seed{args.seed}_steps{args.num_steps}_{args.weights}')
+        f'{args.split}_n{args.num_samples}_seed{args.seed}_steps{args.num_steps}_{args.weights}_uniform')
     # Slurm creates logs before Python starts; existing samples are never reused.
     if output_dir.exists() and (not (output_dir / 'logs').is_dir()
             or any(path.name != 'logs' for path in output_dir.iterdir())):
         raise FileExistsError(f'Sample cache already exists: {output_dir}. Choose another --output-dir.')
-    source_files = ['sample/sample_checkpoint.py', 'sample/sample_io.py',
+    source_files = ['sample/sample_checkpoint.py', 'sample/sample_io.py', 'sample/counterfactual_targets.py',
                     'sample/visualize_counterfactuals.py', 'plot_utils.py', 'samplers.py',
                     'models/sit.py', 'models/embedder.py', 'models/autoencoder.py', 'data_handle/embed.py', 'utils.py']
     metadata = {
@@ -206,6 +219,9 @@ def _sample(args):
         'data_dir': str(data_dir.resolve()), 'num_images': len(indices),
         'indices_sha256': hashlib.sha256(json.dumps(indices).encode()).hexdigest(),
         'arguments': vars(args), 'image_storage': IMAGE_STORAGE, 'torch_version': torch.__version__,
+        'counterfactual_target_policy': 'uniform_v1',
+        'age_range_years': age_range_years,
+        'training_age_csv_sha256': training_age_csv_sha256,
         'inference': 'FP32, TF32 off, posterior mode, selected saved BN; CF/cycle CFG1; generation requested CFG/Heun',
         'sampling_source_sha256': {name: sha256_file(ROOT / name) for name in source_files},
     }
@@ -262,7 +278,8 @@ def _sample(args):
             if 'counterfactual' not in args.tasks:
                 continue
             for attribute in args.attributes:
-                cf_parents, eligible = make_intervention(parents, attribute, args)
+                cf_parents, eligible = make_intervention(
+                    parents, attribute, args, indices=batch_indices, age_range_years=age_range_years)
                 selected = torch.where(eligible)[0]
                 positions = selected.cpu().tolist()
                 eligible_counts[attribute] += len(positions)
@@ -285,6 +302,7 @@ def _sample(args):
             from sample.visualize_counterfactuals import save_counterfactual_visuals
             metadata['num_counterfactual_visuals'] = save_counterfactual_visuals(output_dir, records)
         metadata['eligible_interventions'] = eligible_counts
+        metadata['counterfactual_targets_sha256'] = counterfactual_targets_hash(records)
         metadata['reference_images_sha256'] = reference_images_hash(records)
         metadata['num_saved_images'] = len(records)
         metadata['status'] = 'complete'

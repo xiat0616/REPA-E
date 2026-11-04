@@ -21,6 +21,7 @@ split="test"
 num_samples=1000
 num_steps=50
 seed=1234
+sample_suffix="${SAMPLE_SUFFIX-_uniform}"
 
 # Metric settings.
 batch_size=4
@@ -57,7 +58,7 @@ if [ "$ldm_exp" = "$repa_exp" ] || [ "$ldm_exp" = "$repae_exp" ] || [ "$repa_exp
 fi
 printf -v checkpoint_name '%07d' "$((10#$checkpoint_step))"
 
-sample_name="${split}_n${num_samples}_seed${seed}_steps${num_steps}_${weights}"
+sample_name="${split}_n${num_samples}_seed${seed}_steps${num_steps}_${weights}${sample_suffix}"
 ldm_samples="${sampling_root}/${ldm_exp}/step_${checkpoint_name}/${sample_name}"
 repa_samples="${sampling_root}/${repa_exp}/step_${checkpoint_name}/${sample_name}"
 repae_samples="${sampling_root}/${repae_exp}/step_${checkpoint_name}/${sample_name}"

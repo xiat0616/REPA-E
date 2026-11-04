@@ -17,6 +17,7 @@ batch_size=4
 num_workers=0
 seed=1234
 cfg_scale=1.0
+sample_suffix="${SAMPLE_SUFFIX-_uniform}"
 
 if [ "$partition" != "gpus48" ] && [ "$partition" != "gpus24" ]; then
     echo "Unknown partition: $partition. Use gpus48 or gpus24." >&2
@@ -95,7 +96,7 @@ done
 if [ -z "$save_dir" ]; then
     exp_name="$(basename "$(dirname "$(dirname "$checkpoint")")")"
     checkpoint_name="$(basename "$checkpoint" .pt)"
-    sample_name="${split}_n${num_samples}_seed${seed}_steps${num_steps}_${weights}"
+    sample_name="${split}_n${num_samples}_seed${seed}_steps${num_steps}_${weights}${sample_suffix}"
     save_dir="${output_root}/${exp_name}/step_${checkpoint_name}/${sample_name}"
 fi
 if [ "${save_dir:0:1}" != "/" ]; then

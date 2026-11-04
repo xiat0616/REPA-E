@@ -248,6 +248,8 @@ def main(args):
         raise ValueError('Cached experiment must be a single folder name.')
     output_root = Path(args.output_root).expanduser().resolve()
     run_label = f"{sample_config['split']}_n{len(indices)}_seed{seed}_steps{sample_config['arguments'].get('num_steps', 50)}_{sample_config['weights']}"
+    if sample_config.get('counterfactual_target_policy') == 'uniform_v1':
+        run_label += '_uniform'
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else output_root / experiment / f'step_{step_label}' / run_label
     # Slurm creates logs before Python starts; existing metrics are never reused.
     if output_dir.exists() and (not (output_dir / 'logs').is_dir()
@@ -300,7 +302,9 @@ def main(args):
         'checkpoint', 'step', 'experiment', 'weights', 'vae_source', 'model', 'resolution',
         'split', 'split_csv_sha256', 'num_images', 'indices_sha256')}
     for key in ('checkpoint_bytes', 'checkpoint_mtime_ns', 'split_csv', 'image_storage',
-                'sampling_source_sha256', 'reference_images_sha256'):
+                'sampling_source_sha256', 'reference_images_sha256',
+                'counterfactual_target_policy', 'age_range_years', 'training_age_csv_sha256',
+                'counterfactual_targets_sha256'):
         if key in sample_config:
             metadata[key] = sample_config[key]
     cache_hashes = {name: sha256_file(samples_dir / name) for name in ('config.json', 'indices.json', 'samples.csv')}
@@ -327,6 +331,10 @@ def main(args):
             'Categorical target accuracy is higher-is-better; age target errors are in years and lower-is-better. '
             'Input-target scores are no-edit diagnostics. Inspect the predictor held-out performance; '
             'prediction agreement is an imperfect proxy for edit success.')
+        if sample_config.get('counterfactual_target_policy') == 'uniform_v1':
+            metadata['notes'].append(
+                'Uniform targets include same-target controls. Effectiveness includes these controls; '
+                'compare input-target diagnostics and retain source/target breakdowns.')
     signature = dict(metadata)
     signature.pop('status')
     signature['arguments'] = {key: value for key, value in arguments.items()

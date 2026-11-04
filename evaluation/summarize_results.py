@@ -495,6 +495,10 @@ PROTOCOL_METADATA = (
     "weights", "inference", "feature_extractors", "source_sha256",
     "image_storage", "sampling_source_sha256", "reference_images_sha256",
 )
+TARGET_PROTOCOL_METADATA = (
+    'counterfactual_target_policy', 'age_range_years', 'training_age_csv_sha256',
+    'counterfactual_targets_sha256',
+)
 
 
 def _sha256(path):
@@ -593,6 +597,9 @@ def validate_results(runs):
         for key in PROTOCOL_ARGUMENTS:
             if configs[method]["arguments"][key] != reference["arguments"][key]:
                 raise ValueError(f"{method}: evaluation setting {key} differs from LDM")
+        for key in TARGET_PROTOCOL_METADATA:
+            if configs[method].get(key) != reference.get(key):
+                raise ValueError(f"{method}: counterfactual target protocol {key} differs from LDM")
         if predictors[method] != predictors["LDM"]:
             raise ValueError(f"{method}: attribute predictor or age tolerance differs from LDM")
     protocol = {
@@ -608,6 +615,7 @@ def validate_results(runs):
     }
     if predictors["LDM"] is not None:
         protocol["attribute_predictor"] = predictors["LDM"]["predictor"]
+    protocol.update({key: reference[key] for key in TARGET_PROTOCOL_METADATA if key in reference})
     return protocol, selections["LDM"], fingerprints
 
 

@@ -142,6 +142,17 @@ class EffectivenessReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'age tolerance'):
             reporting.validate_results(self.runs)
 
+    def test_reject_different_counterfactual_target_assignments(self):
+        for method in reporting.METHODS:
+            self.change_config(method, lambda config: config.update(
+                counterfactual_target_policy='uniform_v1', counterfactual_targets_sha256='2' * 64,
+                age_range_years=[30., 90.], training_age_csv_sha256='3' * 64))
+        protocol, _, _ = reporting.validate_results(self.runs)
+        self.assertEqual(protocol['counterfactual_targets_sha256'], '2' * 64)
+        self.change_config('REPA', lambda config: config.update(counterfactual_targets_sha256='4' * 64))
+        with self.assertRaisesRegex(ValueError, 'target assignments|target protocol'):
+            reporting.validate_results(self.runs)
+
     def test_reject_missing_predictor_metadata(self):
         self.change_config('REPA', lambda config: config.pop('attribute_predictor'))
         with self.assertRaisesRegex(ValueError, 'attribute_predictor metadata'):

@@ -133,8 +133,7 @@ class EffectivenessMetrics:
                 raise ValueError('Counterfactual manifest attribute differs from the requested scorer.')
             source = _label(row['source'], attribute)
             target = _label(row['target'], attribute)
-            if math.isclose(source, target, rel_tol=0, abs_tol=1e-6):
-                raise ValueError('Effectiveness requires a genuine source-to-target intervention.')
+            # Uniform interventions include do(source) controls, which are scored too.
             if attribute in row and not math.isclose(_label(row[attribute], attribute), target,
                                                      rel_tol=0, abs_tol=1e-4):
                 raise ValueError('Manifest attribute label disagrees with the requested target.')

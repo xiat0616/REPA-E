@@ -24,6 +24,7 @@ batch_size=4
 num_workers=0
 seed=1234
 cfg_scale=1.0
+sample_suffix="${SAMPLE_SUFFIX-_uniform}"
 
 dry_run=false
 if [ "${3:-}" = "--dry-run" ]; then
@@ -74,7 +75,7 @@ ldm_ckpt="${checkpoint_dir}/${ldm_exp}/checkpoints/${checkpoint_name}.pt"
 repa_ckpt="${checkpoint_dir}/${repa_exp}/checkpoints/${checkpoint_name}.pt"
 repae_ckpt="${checkpoint_dir}/${repae_exp}/checkpoints/${checkpoint_name}.pt"
 
-sample_name="${split}_n${num_samples}_seed${seed}_steps${num_steps}_${weights}"
+sample_name="${split}_n${num_samples}_seed${seed}_steps${num_steps}_${weights}${sample_suffix}"
 ldm_samples="${output_dir}/${ldm_exp}/step_${checkpoint_name}/${sample_name}"
 repa_samples="${output_dir}/${repa_exp}/step_${checkpoint_name}/${sample_name}"
 repae_samples="${output_dir}/${repae_exp}/step_${checkpoint_name}/${sample_name}"
