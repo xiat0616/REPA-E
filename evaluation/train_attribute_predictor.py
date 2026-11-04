@@ -244,22 +244,39 @@ class AttributeDataset(Dataset):
     def __init__(self, frame, data_dir, height, width):
         self.frame = frame.reset_index(drop=True)
         self.data_dir = data_dir
+        self.resolution = (height, width)
         self.transform = build_image_transform(DatasetConfig(img_height=height, img_width=width, img_channels=1))
 
     def __len__(self):
         return len(self.frame)
 
     def __getitem__(self, index):
+        image_path = '<unknown>'
         try:
-            image, labels = get_sample(self.data_dir, self.frame.iloc[index], normalize_age=False)
+            row = self.frame.iloc[index]
+            image_path = str(row.get('image_path', '<unknown>'))
+            image, labels = get_sample(self.data_dir, row, normalize_age=False)
             image = self.transform(image)
-            if image.ndim != 3 or image.shape[0] != 1 or not torch.isfinite(image).all() or image.min() < 0 or image.max() > 1:
-                raise ValueError("Expected a finite 1xHxW image in [0,1]")
+            shape = tuple(image.shape) if torch.is_tensor(image) else None
+            if not torch.is_tensor(image) or shape != (1, *self.resolution) or not image.is_floating_point():
+                raise ValueError(f"Expected floating-point image shape {(1, *self.resolution)}, "
+                                 f"got shape={shape}, dtype={getattr(image, 'dtype', type(image).__name__)}")
+            if not torch.isfinite(image).all():
+                raise ValueError(f"Image contains NaN/Inf; shape={shape}, dtype={image.dtype}")
+            minimum, maximum = float(image.min()), float(image.max())
+            # Match EMBED.__getitem__: antialiased Resize can overshoot [0,1]
+            # by float32 rounding, while saved sample PNGs are clamped as well.
+            if minimum < -1e-6 or maximum > 1.0 + 1e-6:
+                raise ValueError(f"Expected image values in [0,1] (roundoff tolerance 1e-6), "
+                                 f"got min={minimum:.10g}, max={maximum:.10g}; "
+                                 f"shape={shape}, dtype={image.dtype}")
+            image = image.clamp(0.0, 1.0)
             target = {key: torch.tensor(labels[key], dtype=torch.long if key in CLASS_COUNTS else torch.float32)
                       for key in ATTRIBUTES}
             return image, target
         except Exception as error:
-            raise RuntimeError(f"Image read/preprocessing failed at dataset row {index}; no replacement was sampled") from error
+            raise RuntimeError(f"Image read/preprocessing failed at dataset row {index} "
+                               f"(image_path={image_path}): {error}; no replacement was sampled") from error
 
 
 def training_statistics(frame):

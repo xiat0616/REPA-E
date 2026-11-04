@@ -127,6 +127,10 @@ The predictor uses an ImageNet-initialized ResNet-50, separate heads for view
 images; it never receives conditioning attributes as inputs. Real-image reads
 use the same breast masking, fixed image scale and 256×192 resizing as sampling,
 followed by grayscale-to-RGB repetition and ImageNet normalization.
+As in the existing EMBED loader, resized values within `1e-6` of `[0,1]` are
+clamped to that interval to absorb floating-point roundoff. Nonfinite values,
+incorrect shapes and larger range errors fail with the row, image path and
+diagnostic details; images are never silently replaced.
 ImageNet initialization may download weights during training; scoring is offline.
 
 The trainer checks patient IDs and image paths across the complete train,

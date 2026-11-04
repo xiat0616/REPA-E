@@ -106,6 +106,98 @@ class PredictorTests(unittest.TestCase):
                 dataset[0]
             self.assertEqual(read.call_count, 1)
 
+    def test_dataset_accepts_resize_roundoff_and_preserves_labels(self):
+        dataset = AttributeDataset(self.frame("train"), self.root, 32, 32)
+        source_labels = {"view": 1, "density": 3, "scanner": 4, "age": 63.5, "cview": 0}
+        original_labels = source_labels.copy()
+        transformed = torch.full((1, 32, 32), .5, dtype=torch.float32)
+        transformed[0, 0, 0] = torch.nextafter(torch.tensor(1., dtype=torch.float32),
+                                               torch.tensor(float("inf"), dtype=torch.float32))
+        transformed[0, 0, 1] = -torch.finfo(torch.float32).eps
+        self.assertGreater(float(transformed.max()), 1.)
+        self.assertLess(float(transformed.min()), 0.)
+        with patch("evaluation.train_attribute_predictor.get_sample",
+                   return_value=(np.zeros((32, 32), dtype=np.uint8), source_labels)) as read, \
+             patch.object(dataset, "transform", return_value=transformed):
+            image, target = dataset[0]
+        self.assertEqual(tuple(image.shape), (1, 32, 32))
+        self.assertEqual(image.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(image).all())
+        self.assertEqual((float(image.min()), float(image.max())), (0., 1.))
+        self.assertEqual(float(image[0, 2, 2]), .5)
+        for attribute in ATTRIBUTES:
+            self.assertEqual(target[attribute].item(), source_labels[attribute])
+            self.assertEqual(target[attribute].dtype, torch.long if attribute in CLASS_COUNTS else torch.float32)
+        self.assertEqual(source_labels, original_labels)
+        read.assert_called_once()
+        self.assertIs(read.call_args.kwargs["normalize_age"], False)
+
+    def test_dataset_rejects_real_range_errors_nonfinite_values_and_bad_shapes(self):
+        dataset = AttributeDataset(self.frame("train"), self.root, 32, 32)
+        labels = {"view": 0, "density": 0, "scanner": 0, "age": 40., "cview": 0}
+        invalid = []
+        for name, value in (("below_range", -1e-3), ("above_range", 1. + 1e-3),
+                            ("nan", float("nan")), ("positive_inf", float("inf")),
+                            ("negative_inf", -float("inf"))):
+            image = torch.full((1, 32, 32), .5)
+            image[0, 0, 0] = value
+            invalid.append((name, image, "range" if "range" in name else "finite"))
+        invalid.extend((
+            ("rgb_channels", torch.zeros(3, 32, 32), "shape"),
+            ("missing_channel_axis", torch.zeros(32, 32), "shape"),
+            ("extra_batch_axis", torch.zeros(1, 1, 32, 32), "shape"),
+            ("incorrect_spatial_size", torch.zeros(1, 31, 32), "shape"),
+            ("integer_output", torch.zeros(1, 32, 32, dtype=torch.uint8), "dtype"),
+        ))
+        for name, transformed, kind in invalid:
+            with self.subTest(case=name), \
+                 patch("evaluation.train_attribute_predictor.get_sample",
+                       return_value=(np.zeros((32, 32), dtype=np.uint8), labels)) as read, \
+                 patch.object(dataset, "transform", return_value=transformed):
+                with self.assertRaises(RuntimeError) as failed:
+                    dataset[0]
+                self.assertIn("row 0", str(failed.exception))
+                self.assertIn("train-a.png", str(failed.exception))
+                self.assertIn("no replacement", str(failed.exception))
+                self.assertIsInstance(failed.exception.__cause__, (ValueError, TypeError))
+                cause = str(failed.exception.__cause__).lower()
+                if kind == "range":
+                    self.assertIn("min=", cause)
+                    self.assertIn("max=", cause)
+                elif kind == "finite":
+                    self.assertIn("nan/inf", cause)
+                elif kind == "shape":
+                    self.assertIn("shape=", cause)
+                else:
+                    self.assertIn("dtype=", cause)
+                read.assert_called_once()
+
+    def test_real_resize_pipeline_handles_white_and_edge_uint8_images(self):
+        torch.set_num_threads(1)
+        dataset = AttributeDataset(self.frame("train"), self.root, 256, 192)
+        labels = {"view": 0, "density": 0, "scanner": 0, "age": 40., "cview": 0}
+        white = np.full((1024, 768), 255, dtype=np.uint8)
+        edge = np.zeros((1024, 768), dtype=np.uint8)
+        edge[:, 384:] = 255
+        for name, pixels in (("white", white), ("edge", edge)):
+            with self.subTest(image=name), \
+                 patch("evaluation.train_attribute_predictor.get_sample", return_value=(pixels, labels)) as read, \
+                 torch.inference_mode():
+                # Exercise the actual ToTensor + antialiased Resize, not a mock.
+                image, target = dataset[0]
+                self.assertEqual(tuple(image.shape), (1, 256, 192))
+                self.assertTrue(torch.isfinite(image).all())
+                self.assertGreaterEqual(float(image.min()), 0.)
+                self.assertLessEqual(float(image.max()), 1.)
+                if name == "white":
+                    self.assertTrue(torch.allclose(image, torch.ones_like(image), atol=1e-6, rtol=0))
+                else:
+                    self.assertEqual(float(image.min()), 0.)
+                    self.assertEqual(float(image.max()), 1.)
+                    self.assertTrue(((image > 0) & (image < 1)).any())
+                self.assertEqual(target["age"].item(), 40.)
+                read.assert_called_once()
+
     def test_real_resnet18_forward_contract_without_pretrained_weights(self):
         torch.set_num_threads(1)
         model = AttributePredictor("resnet18", "none", (32, 32), 50., 10.).eval()
